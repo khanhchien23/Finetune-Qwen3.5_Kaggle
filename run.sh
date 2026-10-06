@@ -20,8 +20,9 @@ conda activate "$ENV_NAME"
 # Kaggle CLI: chạy bản MỚI NHẤT trong một Python 3.12 tách biệt bằng uv (uv đã được cài ở pull_and_install.sh).
 # Lý do: Python 3.10 của qwen_env chỉ cài được kaggle 1.7.x, bản này không hiểu token mới (KGAT_...)
 # và báo "KeyError: 'username'". Không đụng gì tới môi trường train.
-kaggle_cli() { uv tool run --python 3.12 kaggle "$@"; }
-
+# kaggle_cli() { uv tool run --python 3.12 kaggle "$@"; }
+uv tool install --python 3.12 kaggle
+export PATH="$HOME/.local/bin:$PATH"
 # ---------------------------------------------------------------------
 # 2) Kiểm tra đăng nhập Kaggle / HF / wandb (thiếu cái nào dừng ngay, khỏi tải xong mới lỗi)
 # ---------------------------------------------------------------------
