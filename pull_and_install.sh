@@ -105,7 +105,7 @@ if [ ! -f "$MARKER" ]; then
     uv pip install --no-build-isolation causal_conv1d==1.6.0
     uv pip install --no-deps --upgrade "torchao>=0.16.0"
 
-    uv pip install huggingface_hub wandb datasets kaggle
+    uv pip install huggingface_hub wandb datasets
 
     if [ -f "$SOURCE_DIR/requirements.txt" ]; then
         uv pip install -r "$SOURCE_DIR/requirements.txt"
