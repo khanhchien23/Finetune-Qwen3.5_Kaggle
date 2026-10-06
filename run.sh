@@ -21,8 +21,9 @@ conda activate "$ENV_NAME"
 # Lý do: Python 3.10 của qwen_env chỉ cài được kaggle 1.7.x, bản này không hiểu token mới (KGAT_...)
 # và báo "KeyError: 'username'". Không đụng gì tới môi trường train.
 # kaggle_cli() { uv tool run --python 3.12 kaggle "$@"; }
-uv tool install --python 3.12 kaggle
+uv tool install --python 3.12 --force kaggle
 export PATH="$HOME/.local/bin:$PATH"
+hash -r
 # ---------------------------------------------------------------------
 # 2) Kiểm tra đăng nhập Kaggle / HF / wandb (thiếu cái nào dừng ngay, khỏi tải xong mới lỗi)
 # ---------------------------------------------------------------------
@@ -47,12 +48,12 @@ fi
 mkdir -p "$DATA_DIR"
 if [ ! -f "$DATA_DIR/.downloaded" ]; then
     echo ">> Kiểm tra truy cập dataset $KAGGLE_DATASET ..."
-    if ! kaggle_cli datasets files "$KAGGLE_DATASET" >/dev/null; then
+    if ! kaggle datasets files "$KAGGLE_DATASET" >/dev/null; then
         echo "!! Không truy cập được dataset. Kiểm tra: KAGGLE_API_TOKEN đúng chưa, tên dataset đúng chưa, dataset đã Public chưa."
         exit 1
     fi
     echo ">> Tải dataset $KAGGLE_DATASET về $DATA_DIR (có thể mất một lúc)..."
-    kaggle_cli datasets download -d "$KAGGLE_DATASET" -p "$DATA_DIR" --unzip
+    kaggle datasets download -d "$KAGGLE_DATASET" -p "$DATA_DIR" --unzip
     touch "$DATA_DIR/.downloaded"
 else
     echo ">> Dữ liệu đã tải từ trước ($DATA_DIR), bỏ qua."
