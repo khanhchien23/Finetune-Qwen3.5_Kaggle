@@ -21,7 +21,7 @@ conda activate "$ENV_NAME"
 # Lý do: Python 3.10 của qwen_env chỉ cài được kaggle 1.7.x, bản này không hiểu token mới (KGAT_...)
 # và báo "KeyError: 'username'". Không đụng gì tới môi trường train.
 # kaggle_cli() { uv tool run --python 3.12 kaggle "$@"; }
-uv tool install --python 3.12 --force kaggle
+uv tool install --python 3.12 --force "kaggle==1.5.3"
 export PATH="$HOME/.local/bin:$PATH"
 hash -r
 # ---------------------------------------------------------------------
