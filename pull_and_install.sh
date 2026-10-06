@@ -4,7 +4,7 @@
 # mới nếu không tìm thấy conda nào. Không cần sudo/apt-get.
 set -e
 
-REPO_URL="https://github.com/khanhchien23/Finetune-Qwen3.5.git"
+REPO_URL="https://github.com/khanhchien23/Finetune-Qwen3.5_Kaggle.git"
 SOURCE_DIR=~/source_code
 ENV_NAME="qwen_env"
 PY_VERSION="3.10"
