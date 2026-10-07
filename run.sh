@@ -5,6 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KAGGLE_DATASET="${KAGGLE_DATASET:-khanhchien/anh-mo-phong-1}"   # đổi sang dataset zip mới khi bạn upload lại
+KAGGLE_KERNEL="${KAGGLE_KERNEL:-}"   # nếu đặt (vd. khanhchien/zip-anh-mo-phong): tải OUTPUT của notebook (các file .zip) thay vì tải dataset
 DATA_DIR=~/kaggle_data            # nơi chứa dữ liệu sau khi tải + giải nén
 SOURCE_DIR=~/source_code
 ENV_NAME="qwen_env"
@@ -193,6 +194,18 @@ download_dataset() {
     done
     return 1
 }
+
+# ---- Đường tải qua notebook Kaggle: chỉ vài file .zip lớn, nhanh và không bị giới hạn như tải hàng nghìn file lẻ ----
+if [ -n "$KAGGLE_KERNEL" ] && [ ! -f "$DATA_DIR/.downloaded" ]; then
+    echo ">> Tải output của notebook $KAGGLE_KERNEL về $DATA_DIR ..."
+    kaggle kernels output "$KAGGLE_KERNEL" -p "$DATA_DIR" || true
+    if ! has_data; then
+        echo "!! Không tải được output của notebook $KAGGLE_KERNEL."
+        echo "   Kiểm tra: tên notebook đúng chưa (khanhchien/<slug trên URL>), đã Save Version -> Save & Run All xong chưa."
+        exit 1
+    fi
+    touch "$DATA_DIR/.downloaded"
+fi
 
 if [ ! -f "$DATA_DIR/.downloaded" ]; then
     echo ">> Kiểm tra truy cập dataset $KAGGLE_DATASET ..."
