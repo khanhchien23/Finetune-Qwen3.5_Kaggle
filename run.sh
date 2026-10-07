@@ -50,15 +50,26 @@ mkdir -p "$DATA_DIR"
 # Tải dataset: thử lần lượt nhiều cách, cách nào xong thì dừng.
 # Lý do: "kaggle datasets files" chạy được nhưng lệnh tải CẢ dataset (DownloadDataset) có thể trả 404
 # (vd. dataset quá lớn / bản dataset chưa xử lý xong), nên cần đường dự phòng gọi thẳng REST API bằng curl.
+# Có file dữ liệu thật trong DATA_DIR chưa (không tính file đánh dấu)
+has_data() { [ -n "$(find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' -print -quit)" ]; }
+
+# Tự chữa: file đánh dấu .downloaded có nhưng thư mục rỗng (do lần tải lỗi trước đó) -> xóa để tải lại
+if [ -f "$DATA_DIR/.downloaded" ] && ! has_data; then
+    echo ">> Có file đánh dấu .downloaded nhưng $DATA_DIR rỗng -> tải lại."
+    rm -f "$DATA_DIR/.downloaded"
+fi
+
 download_dataset() {
     local owner="${KAGGLE_DATASET%%/*}" slug="${KAGGLE_DATASET##*/}"
     local zip="$DATA_DIR/_dataset.zip"
     local url="${KAGGLE_DL_URL:-https://www.kaggle.com/api/v1/datasets/download/$owner/$slug}"
 
     echo ">> [Cách 1] kaggle CLI: tải cả dataset..."
-    if kaggle datasets download -d "$KAGGLE_DATASET" -p "$DATA_DIR" --unzip; then
+    kaggle datasets download -d "$KAGGLE_DATASET" -p "$DATA_DIR" --unzip || true
+    if has_data; then
         return 0
     fi
+    echo ">> Cách 1 không tải được file nào (Kaggle CLI có thể in lỗi nhưng vẫn thoát mã 0)."
 
     echo ">> [Cách 2] curl gọi thẳng REST API (tự thử lại, tiếp tục được nếu đứt mạng)..."
     local mode
@@ -92,6 +103,10 @@ if [ ! -f "$DATA_DIR/.downloaded" ]; then
         echo "   (1) có hiển thị danh sách file và không còn trạng thái đang xử lý (processing);"
         echo "   (2) thử bấm Download trên web. Nếu web cũng không tải được, hãy tạo lại version dataset"
         echo "       hoặc chia nhỏ dataset thành vài file .zip (mỗi file vài GB) rồi upload lại."
+        exit 1
+    fi
+    if ! has_data; then
+        echo "!! Tải xong nhưng $DATA_DIR vẫn rỗng."
         exit 1
     fi
     touch "$DATA_DIR/.downloaded"
