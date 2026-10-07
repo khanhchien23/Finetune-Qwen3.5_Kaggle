@@ -56,6 +56,14 @@ mkdir -p "$DATA_DIR"
 count_files() { find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' ! -name '_filelist.txt' ! -name '.err_*' ! -name '_last_error.txt' ! -path '*/.cache/*' | wc -l; }
 has_data()    { [ "$(count_files)" -gt 0 ]; }
 
+# Nguồn dữ liệu hiện tại. File đánh dấu .downloaded ghi lại nguồn đã tải; nếu nguồn đổi
+# (hoặc file đánh dấu là bản cũ không có nội dung) thì dữ liệu cũ không đáng tin -> xóa và tải lại.
+SOURCE_ID="hf=$HF_DATA_REPO|kernel=$KAGGLE_KERNEL|dataset=$KAGGLE_DATASET"
+if [ -f "$DATA_DIR/.downloaded" ] && [ "$(cat "$DATA_DIR/.downloaded" 2>/dev/null)" != "$SOURCE_ID" ]; then
+    echo ">> Dữ liệu cũ trong $DATA_DIR không khớp nguồn hiện tại ($SOURCE_ID) -> xóa và tải lại."
+    find "$DATA_DIR" -mindepth 1 -delete
+fi
+
 # Tự chữa: file đánh dấu .downloaded có nhưng thư mục rỗng (do lần tải lỗi trước đó) -> xóa để tải lại
 if [ -f "$DATA_DIR/.downloaded" ] && ! has_data; then
     echo ">> Có file đánh dấu .downloaded nhưng $DATA_DIR rỗng -> tải lại."
@@ -207,7 +215,7 @@ if [ -n "$HF_DATA_REPO" ] && [ ! -f "$DATA_DIR/.downloaded" ]; then
         echo "   Kiểm tra: HF_TOKEN có quyền đọc repo này chưa, tên repo đúng chưa (dạng TenTaiKhoan/ten-repo)."
         exit 1
     fi
-    touch "$DATA_DIR/.downloaded"
+    echo "$SOURCE_ID" > "$DATA_DIR/.downloaded"
 fi
 
 # ---- Đường tải qua notebook Kaggle: chỉ vài file .zip lớn, nhanh và không bị giới hạn như tải hàng nghìn file lẻ ----
@@ -219,7 +227,7 @@ if [ -n "$KAGGLE_KERNEL" ] && [ ! -f "$DATA_DIR/.downloaded" ]; then
         echo "   Kiểm tra: tên notebook đúng chưa (khanhchien/<slug trên URL>), đã Save Version -> Save & Run All xong chưa."
         exit 1
     fi
-    touch "$DATA_DIR/.downloaded"
+    echo "$SOURCE_ID" > "$DATA_DIR/.downloaded"
 fi
 
 if [ ! -f "$DATA_DIR/.downloaded" ]; then
@@ -242,7 +250,7 @@ if [ ! -f "$DATA_DIR/.downloaded" ]; then
         echo "!! Tải xong nhưng $DATA_DIR vẫn rỗng."
         exit 1
     fi
-    touch "$DATA_DIR/.downloaded"
+    echo "$SOURCE_ID" > "$DATA_DIR/.downloaded"
 else
     echo ">> Dữ liệu đã tải từ trước ($DATA_DIR), bỏ qua."
 fi
