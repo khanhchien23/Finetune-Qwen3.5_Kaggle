@@ -4,7 +4,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KAGGLE_DATASET="khanhchien/anh-mo-phong-1"
+KAGGLE_DATASET="${KAGGLE_DATASET:-khanhchien/anh-mo-phong-1}"   # đổi sang dataset zip mới khi bạn upload lại
 DATA_DIR=~/kaggle_data            # nơi chứa dữ liệu sau khi tải + giải nén
 SOURCE_DIR=~/source_code
 ENV_NAME="qwen_env"
@@ -51,7 +51,7 @@ mkdir -p "$DATA_DIR"
 # Lý do: "kaggle datasets files" chạy được nhưng lệnh tải CẢ dataset (DownloadDataset) có thể trả 404
 # (vd. dataset quá lớn / bản dataset chưa xử lý xong), nên cần đường dự phòng gọi thẳng REST API bằng curl.
 # Đếm file dữ liệu thật trong DATA_DIR (không tính file đánh dấu / file tạm của script)
-count_files() { find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' ! -name '_filelist.txt' | wc -l; }
+count_files() { find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' ! -name '_filelist.txt' ! -name '.err_*' ! -name '_last_error.txt' | wc -l; }
 has_data()    { [ "$(count_files)" -gt 0 ]; }
 
 # Tự chữa: file đánh dấu .downloaded có nhưng thư mục rỗng (do lần tải lỗi trước đó) -> xóa để tải lại
@@ -89,13 +89,15 @@ dl_one() {
     [ -s "$d/$b" ] && return 0
     mkdir -p "$d"
     for i in 1 2 3; do
-        kaggle datasets download -d "$KAGGLE_DATASET" -f "$f" -p "$d" -q >/dev/null 2>&1 || true
+        kaggle datasets download -d "$KAGGLE_DATASET" -f "$f" -p "$d" -q > "$d/.err_$b" 2>&1 || true
         if [ -s "$d/$b" ] || find "$d" -name "$b" -type f -size +0 2>/dev/null | grep -q .; then
+            rm -f "$d/.err_$b"
             return 0
         fi
-        sleep 2
+        sleep $((i * 10))                      # lùi dần: phòng trường hợp bị giới hạn tốc độ
     done
-    echo "FAIL $f" >&2
+    tail -3 "$d/.err_$b" > "$DATA_DIR/_last_error.txt" 2>/dev/null
+    rm -f "$d/.err_$b"
     return 1
 }
 export -f dl_one
@@ -108,6 +110,25 @@ count_missing() {
         [ -s "$DATA_DIR/$f" ] || n=$((n + 1))
     done < "$1"
     echo "$n"
+}
+
+# --- Hiển thị tiến độ tải: số file, %, tốc độ, thời gian còn lại ước tính, dung lượng ---
+fmt_time() { printf '%dh%02dm' $(( $1 / 3600 )) $(( ($1 % 3600) / 60 )); }
+progress_monitor() {
+    local total="$1" pid="$2" t0 n0 n now el rate left size
+    t0="$(date +%s)"; n0="$(count_files)"
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep "${PROGRESS_SEC:-30}"
+        kill -0 "$pid" 2>/dev/null || break
+        n="$(count_files)"; now="$(date +%s)"; el=$(( now - t0 )); size="$(du -sh "$DATA_DIR" 2>/dev/null | cut -f1)"
+        if [ "$n" -gt "$n0" ] && [ "$el" -gt 0 ]; then
+            rate="$(awk -v a="$n" -v b="$n0" -v t="$el" 'BEGIN{printf "%.1f", (a-b)/t}')"
+            left="$(awk -v a="$n" -v T="$total" -v r="$rate" 'BEGIN{ if (r>0) printf "%d", (T-a)/r; else print 0 }')"
+            echo ">> Tiến độ: $n/$total ($(( 100 * n / total ))%) | $rate file/s | còn ~$(fmt_time "$left") | $size"
+        else
+            echo ">> Tiến độ: $n/$total ($(( 100 * n / total ))%) | chưa có file mới sau ${el}s | $size"
+        fi
+    done
 }
 
 download_dataset() {
@@ -152,11 +173,22 @@ download_dataset() {
         return 1
     fi
     total="$(wc -l < "$list")"
-    echo ">> Dataset có $total file. Tải song song ${DL_JOBS:-6} luồng (có thể mất khá lâu)..."
+    echo ">> Dataset có $total file."
+    if [ "$total" -gt 3000 ]; then
+        echo "!! CẢNH BÁO: $total file lẻ là quá nhiều để tải từng file qua API (dễ bị giới hạn tốc độ, rất lâu)."
+        echo "   Khuyến nghị: gom thành vài file .zip rồi upload lại Kaggle (xem make_zips.py)."
+    fi
+    echo ">> Tải song song ${DL_JOBS:-4} luồng (có thể mất khá lâu)..."
     for round in 1 2 3; do
-        xargs -a "$list" -P "${DL_JOBS:-6}" -I{} bash -c 'dl_one "$1"' _ {} || true
+        xargs -a "$list" -P "${DL_JOBS:-4}" -I{} bash -c 'dl_one "$1"' _ {} &
+        local xpid=$!
+        progress_monitor "$total" "$xpid" &
+        local mpid=$!
+        wait "$xpid" || true
+        kill "$mpid" 2>/dev/null; wait "$mpid" 2>/dev/null || true
         missing="$(count_missing "$list")"
         echo ">> Vòng $round: còn thiếu $missing / $total file."
+        [ -s "$DATA_DIR/_last_error.txt" ] && { echo ">> Lỗi gần nhất từ Kaggle:"; cat "$DATA_DIR/_last_error.txt"; }
         [ "$missing" -eq 0 ] && return 0
     done
     return 1
@@ -191,7 +223,8 @@ fi
 if [ -z "$(find "$DATA_DIR" -name '*.frame_data.json' -print -quit)" ]; then
     echo ">> Chưa thấy *.frame_data.json, thử giải nén các file .zip trong dataset..."
     find "$DATA_DIR" -name '*.zip' | while read -r z; do
-        python -m zipfile -e "$z" "$(dirname "$z")"
+        echo "   giải nén $z"
+        python -m zipfile -e "$z" "$(dirname "$z")" && rm -f "$z"
     done
 fi
 
