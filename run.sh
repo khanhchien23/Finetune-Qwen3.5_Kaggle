@@ -6,6 +6,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KAGGLE_DATASET="${KAGGLE_DATASET:-khanhchien/anh-mo-phong-1}"   # đổi sang dataset zip mới khi bạn upload lại
 KAGGLE_KERNEL="${KAGGLE_KERNEL:-}"   # nếu đặt (vd. khanhchien/zip-anh-mo-phong): tải OUTPUT của notebook (các file .zip) thay vì tải dataset
+HF_DATA_REPO="${HF_DATA_REPO:-}"   # nếu đặt (vd. KhanhChien/anh-mo-phong-zips): tải dữ liệu từ Hugging Face dataset (thường nhanh nhất)
 DATA_DIR=~/kaggle_data            # nơi chứa dữ liệu sau khi tải + giải nén
 SOURCE_DIR=~/source_code
 ENV_NAME="qwen_env"
@@ -28,7 +29,7 @@ hash -r
 # ---------------------------------------------------------------------
 # 2) Kiểm tra đăng nhập Kaggle / HF / wandb (thiếu cái nào dừng ngay, khỏi tải xong mới lỗi)
 # ---------------------------------------------------------------------
-if [ -z "$KAGGLE_API_TOKEN" ] && [ -z "$KAGGLE_KEY" ] \
+if [ -z "$HF_DATA_REPO" ] && [ -z "$KAGGLE_API_TOKEN" ] && [ -z "$KAGGLE_KEY" ] \
    && [ ! -f ~/.kaggle/access_token ] && [ ! -f ~/.kaggle/kaggle.json ]; then
     echo "!! CẢNH BÁO: chưa có Kaggle API token."
     echo "   Cách nhanh: export KAGGLE_API_TOKEN='<token>'   (hoặc đặt file ~/.kaggle/kaggle.json)"
@@ -52,7 +53,7 @@ mkdir -p "$DATA_DIR"
 # Lý do: "kaggle datasets files" chạy được nhưng lệnh tải CẢ dataset (DownloadDataset) có thể trả 404
 # (vd. dataset quá lớn / bản dataset chưa xử lý xong), nên cần đường dự phòng gọi thẳng REST API bằng curl.
 # Đếm file dữ liệu thật trong DATA_DIR (không tính file đánh dấu / file tạm của script)
-count_files() { find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' ! -name '_filelist.txt' ! -name '.err_*' ! -name '_last_error.txt' | wc -l; }
+count_files() { find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' ! -name '_filelist.txt' ! -name '.err_*' ! -name '_last_error.txt' ! -path '*/.cache/*' | wc -l; }
 has_data()    { [ "$(count_files)" -gt 0 ]; }
 
 # Tự chữa: file đánh dấu .downloaded có nhưng thư mục rỗng (do lần tải lỗi trước đó) -> xóa để tải lại
@@ -194,6 +195,20 @@ download_dataset() {
     done
     return 1
 }
+
+# ---- Đường tải qua Hugging Face dataset: tải song song nhiều đoạn (hf_xet), thường nhanh hơn Kaggle ----
+if [ -n "$HF_DATA_REPO" ] && [ ! -f "$DATA_DIR/.downloaded" ]; then
+    echo ">> Tải dữ liệu từ Hugging Face dataset $HF_DATA_REPO về $DATA_DIR ..."
+    python -c "import hf_xet" 2>/dev/null || uv pip install -q hf_xet || echo "!! Không cài được hf_xet, sẽ tải bằng cách thường (chậm hơn)."
+    export HF_XET_HIGH_PERFORMANCE=1
+    hf download "$HF_DATA_REPO" --repo-type dataset --local-dir "$DATA_DIR" || true
+    if ! has_data; then
+        echo "!! Không tải được từ Hugging Face dataset $HF_DATA_REPO."
+        echo "   Kiểm tra: HF_TOKEN có quyền đọc repo này chưa, tên repo đúng chưa (dạng TenTaiKhoan/ten-repo)."
+        exit 1
+    fi
+    touch "$DATA_DIR/.downloaded"
+fi
 
 # ---- Đường tải qua notebook Kaggle: chỉ vài file .zip lớn, nhanh và không bị giới hạn như tải hàng nghìn file lẻ ----
 if [ -n "$KAGGLE_KERNEL" ] && [ ! -f "$DATA_DIR/.downloaded" ]; then
