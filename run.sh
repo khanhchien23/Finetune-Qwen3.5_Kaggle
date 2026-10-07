@@ -4,6 +4,16 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Khóa: không cho chạy 2 lần cùng lúc, và phát hiện tiến trình sót lại từ lần chạy trước
+# (vd. xargs/kaggle tải dở vẫn chạy ngầm và ghi file vào thư mục dữ liệu).
+exec 9>"$HOME/.run_sh.lock"
+if ! flock -n 9; then
+    echo "!! Đang có lần chạy run.sh khác, hoặc còn tiến trình sót lại của lần chạy trước (xargs / kaggle / train.py)."
+    echo "   Dừng hết bằng:  pkill -f run.sh; pkill -f xargs; pkill -f 'kaggle datasets download'; pkill -f train.py"
+    echo "   Rồi kiểm tra không còn gì:  ps aux | grep -E 'run.sh|xargs|kaggle|train.py' | grep -v grep"
+    exit 1
+fi
 KAGGLE_DATASET="${KAGGLE_DATASET:-khanhchien/anh-mo-phong-1}"   # đổi sang dataset zip mới khi bạn upload lại
 KAGGLE_KERNEL="${KAGGLE_KERNEL:-}"   # nếu đặt (vd. khanhchien/zip-anh-mo-phong): tải OUTPUT của notebook (các file .zip) thay vì tải dataset
 HF_DATA_REPO="${HF_DATA_REPO:-}"   # nếu đặt (vd. KhanhChien/anh-mo-phong-zips): tải dữ liệu từ Hugging Face dataset (thường nhanh nhất)
@@ -271,6 +281,7 @@ N_LABEL=$(find "$DATA_DIR" -name '*.frame_data.json' | wc -l)
 N_IMG=$(find "$DATA_DIR" -name '*.png' | wc -l)
 echo ">> Tìm thấy: $N_LABEL file nhãn, $N_IMG ảnh png trong $DATA_DIR"
 if [ "$N_LABEL" -eq 0 ] || [ "$N_IMG" -eq 0 ]; then
+    rm -f "$DATA_DIR/.downloaded"      # để lần chạy sau tải lại thay vì "bỏ qua" dữ liệu hỏng
     echo "!! Không đủ nhãn/ảnh. Cấu trúc thư mục hiện có:"
     find "$DATA_DIR" -maxdepth 3 | head -40
     exit 1
