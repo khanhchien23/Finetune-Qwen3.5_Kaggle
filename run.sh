@@ -10,6 +10,12 @@ SOURCE_DIR=~/source_code
 ENV_NAME="qwen_env"
 RUN_DIR=~/train_run               # train.py ghi outputs/ và qwen_lora/ vào đây
 
+
+# 1. Gỡ bỏ phiên bản cũ của cả hai thư viện
+pip uninstall -y kagglehub kagglesdk
+
+# 2. Cài đặt cặp phiên bản tương thích đã biết
+pip install kagglehub==1.0.2 kagglesdk==0.1.16
 # ---------------------------------------------------------------------
 # 1) Pull code + cài thư viện (script con tự dò/cài conda, tạo + activate env)
 # ---------------------------------------------------------------------
