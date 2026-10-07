@@ -50,8 +50,9 @@ mkdir -p "$DATA_DIR"
 # Tải dataset: thử lần lượt nhiều cách, cách nào xong thì dừng.
 # Lý do: "kaggle datasets files" chạy được nhưng lệnh tải CẢ dataset (DownloadDataset) có thể trả 404
 # (vd. dataset quá lớn / bản dataset chưa xử lý xong), nên cần đường dự phòng gọi thẳng REST API bằng curl.
-# Có file dữ liệu thật trong DATA_DIR chưa (không tính file đánh dấu)
-has_data() { [ -n "$(find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' -print -quit)" ]; }
+# Đếm file dữ liệu thật trong DATA_DIR (không tính file đánh dấu / file tạm của script)
+count_files() { find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' ! -name '_filelist.txt' | wc -l; }
+has_data()    { [ "$(count_files)" -gt 0 ]; }
 
 # Tự chữa: file đánh dấu .downloaded có nhưng thư mục rỗng (do lần tải lỗi trước đó) -> xóa để tải lại
 if [ -f "$DATA_DIR/.downloaded" ] && ! has_data; then
@@ -59,18 +60,73 @@ if [ -f "$DATA_DIR/.downloaded" ] && ! has_data; then
     rm -f "$DATA_DIR/.downloaded"
 fi
 
+# --- Liệt kê TOÀN BỘ file của dataset (có nhiều trang) vào file $1 ---
+list_all_files() {
+    local out token="" prev="" ps="--page-size 200"
+    : > "$1"
+    while :; do
+        if [ -n "$token" ]; then
+            out="$(kaggle datasets files "$KAGGLE_DATASET" $ps --page-token "$token" -v 2>/dev/null)" || out=""
+        else
+            out="$(kaggle datasets files "$KAGGLE_DATASET" $ps -v 2>/dev/null)" || out=""
+        fi
+        if [ -z "$out" ] && [ -n "$ps" ]; then ps=""; continue; fi      # page-size 200 bị từ chối -> dùng mặc định
+        [ -z "$out" ] && break
+        token="$(printf '%s\n' "$out" | sed -n 's/^Next Page Token = //p' | head -1)"
+        printf '%s\n' "$out" | grep -vE '^(Next Page Token|name[ ,]|-{3,}|Warning|$)' \
+            | awk -F'[, ]+' '{print $1}' >> "$1"
+        { [ -z "$token" ] || [ "$token" = "$prev" ]; } && break
+        prev="$token"
+    done
+    sort -u -o "$1" "$1"
+    [ -s "$1" ]
+}
+
+# --- Tải MỘT file (có thử lại 3 lần, bỏ qua nếu đã có) ---
+dl_one() {
+    local f="$1" d b i
+    d="$DATA_DIR/$(dirname "$f")"; b="$(basename "$f")"
+    [ -s "$d/$b" ] && return 0
+    mkdir -p "$d"
+    for i in 1 2 3; do
+        kaggle datasets download -d "$KAGGLE_DATASET" -f "$f" -p "$d" -q >/dev/null 2>&1 || true
+        if [ -s "$d/$b" ] || find "$d" -name "$b" -type f -size +0 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "FAIL $f" >&2
+    return 1
+}
+export -f dl_one
+export DATA_DIR KAGGLE_DATASET
+
+# Số file trong danh sách mà máy chưa có
+count_missing() {
+    local f n=0
+    while IFS= read -r f; do
+        [ -s "$DATA_DIR/$f" ] || n=$((n + 1))
+    done < "$1"
+    echo "$n"
+}
+
 download_dataset() {
     local owner="${KAGGLE_DATASET%%/*}" slug="${KAGGLE_DATASET##*/}"
     local zip="$DATA_DIR/_dataset.zip"
     local url="${KAGGLE_DL_URL:-https://www.kaggle.com/api/v1/datasets/download/$owner/$slug}"
+    local before after
 
+    # ---- Cách 1: kaggle CLI tải cả dataset ----
     echo ">> [Cách 1] kaggle CLI: tải cả dataset..."
+    before="$(count_files)"
     kaggle datasets download -d "$KAGGLE_DATASET" -p "$DATA_DIR" --unzip || true
-    if has_data; then
+    after="$(count_files)"
+    if [ "$after" -gt "$before" ]; then
         return 0
     fi
     echo ">> Cách 1 không tải được file nào (Kaggle CLI có thể in lỗi nhưng vẫn thoát mã 0)."
 
+    # ---- Cách 2: curl gọi thẳng REST API ----
     echo ">> [Cách 2] curl gọi thẳng REST API (tự thử lại, tiếp tục được nếu đứt mạng)..."
     local mode
     for mode in with_token no_token; do
@@ -86,6 +142,23 @@ download_dataset() {
         fi
         rm -f "$zip"
     done
+    echo ">> Cách 2 cũng không tải được."
+
+    # ---- Cách 3: tải TỪNG FILE theo danh sách, chạy song song (không cần file nén của cả dataset) ----
+    echo ">> [Cách 3] tải từng file theo danh sách..."
+    local list="$DATA_DIR/_filelist.txt" total missing round
+    if ! list_all_files "$list"; then
+        echo "!! Không lấy được danh sách file của dataset."
+        return 1
+    fi
+    total="$(wc -l < "$list")"
+    echo ">> Dataset có $total file. Tải song song ${DL_JOBS:-6} luồng (có thể mất khá lâu)..."
+    for round in 1 2 3; do
+        xargs -a "$list" -P "${DL_JOBS:-6}" -I{} bash -c 'dl_one "$1"' _ {} || true
+        missing="$(count_missing "$list")"
+        echo ">> Vòng $round: còn thiếu $missing / $total file."
+        [ "$missing" -eq 0 ] && return 0
+    done
     return 1
 }
 
@@ -99,7 +172,7 @@ if [ ! -f "$DATA_DIR/.downloaded" ]; then
     echo "$LISTING" | head -15      # xem nhanh dataset có file gì, dung lượng bao nhiêu
     echo ">> Tải dataset $KAGGLE_DATASET về $DATA_DIR (có thể mất một lúc)..."
     if ! download_dataset; then
-        echo "!! Cả 2 cách tải đều thất bại. Mở trang dataset trên Kaggle, tab Data, kiểm tra:"
+        echo "!! Cả 3 cách tải đều thất bại. Mở trang dataset trên Kaggle, tab Data, kiểm tra:"
         echo "   (1) có hiển thị danh sách file và không còn trạng thái đang xử lý (processing);"
         echo "   (2) thử bấm Download trên web. Nếu web cũng không tải được, hãy tạo lại version dataset"
         echo "       hoặc chia nhỏ dataset thành vài file .zip (mỗi file vài GB) rồi upload lại."
