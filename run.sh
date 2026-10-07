@@ -10,13 +10,6 @@ SOURCE_DIR=~/source_code
 ENV_NAME="qwen_env"
 RUN_DIR=~/train_run               # train.py ghi outputs/ và qwen_lora/ vào đây
 
-
-# 1. Gỡ bỏ phiên bản cũ của cả hai thư viện
-# 1. Gỡ bỏ phiên bản cũ của cả hai thư viện
-pip uninstall -y kagglehub kagglesdk
-
-# 2. Cài đặt cặp phiên bản tương thích đã biết
-pip install kagglehub==1.0.0 kagglesdk==0.1.15
 # ---------------------------------------------------------------------
 # 1) Pull code + cài thư viện (script con tự dò/cài conda, tạo + activate env)
 # ---------------------------------------------------------------------
@@ -28,6 +21,9 @@ conda activate "$ENV_NAME"
 # Lý do: Python 3.10 của qwen_env chỉ cài được kaggle 1.7.x, bản này không hiểu token mới (KGAT_...)
 # và báo "KeyError: 'username'". Không đụng gì tới môi trường train.
 # kaggle_cli() { uv tool run --python 3.12 kaggle "$@"; }
+uv tool install --python 3.12 --force kaggle
+export PATH="$HOME/.local/bin:$PATH"
+hash -r
 # ---------------------------------------------------------------------
 # 2) Kiểm tra đăng nhập Kaggle / HF / wandb (thiếu cái nào dừng ngay, khỏi tải xong mới lỗi)
 # ---------------------------------------------------------------------
@@ -49,29 +45,84 @@ fi
 # ---------------------------------------------------------------------
 # 3) Tải dataset từ Kaggle (bỏ qua nếu đã tải xong từ lần trước)
 # ---------------------------------------------------------------------
-# ---------------------------------------------------------------------
-# 3) Tải dataset từ Kaggle (dùng kagglehub, bỏ qua nếu đã tải xong)
-# ---------------------------------------------------------------------
 mkdir -p "$DATA_DIR"
+
+# Tải dataset: thử lần lượt nhiều cách, cách nào xong thì dừng.
+# Lý do: "kaggle datasets files" chạy được nhưng lệnh tải CẢ dataset (DownloadDataset) có thể trả 404
+# (vd. dataset quá lớn / bản dataset chưa xử lý xong), nên cần đường dự phòng gọi thẳng REST API bằng curl.
+download_dataset() {
+    local owner="${KAGGLE_DATASET%%/*}" slug="${KAGGLE_DATASET##*/}"
+    local zip="$DATA_DIR/_dataset.zip"
+    local url="${KAGGLE_DL_URL:-https://www.kaggle.com/api/v1/datasets/download/$owner/$slug}"
+
+    echo ">> [Cách 1] kaggle CLI: tải cả dataset..."
+    if kaggle datasets download -d "$KAGGLE_DATASET" -p "$DATA_DIR" --unzip; then
+        return 0
+    fi
+
+    echo ">> [Cách 2] curl gọi thẳng REST API (tự thử lại, tiếp tục được nếu đứt mạng)..."
+    local mode
+    for mode in with_token no_token; do
+        local auth=()
+        if [ "$mode" = with_token ]; then
+            [ -n "$KAGGLE_API_TOKEN" ] && auth=(-H "Authorization: Bearer $KAGGLE_API_TOKEN")
+        fi
+        if curl -fL --retry 5 --retry-delay 5 -C - "${auth[@]}" -o "$zip" "$url" \
+           && python -m zipfile -l "$zip" >/dev/null 2>&1; then
+            echo ">> Giải nén $zip ..."
+            python -m zipfile -e "$zip" "$DATA_DIR" && rm -f "$zip"
+            return 0
+        fi
+        rm -f "$zip"
+    done
+    return 1
+}
+
 if [ ! -f "$DATA_DIR/.downloaded" ]; then
-    echo ">> Tải dataset $KAGGLE_DATASET bằng kagglehub..."
-    pip install -q kagglehub
-    python -c "
-import kagglehub, os, shutil, sys
-try:
-    cache_path = kagglehub.dataset_download('${KAGGLE_DATASET}')
-    print('>> Cache:', cache_path)
-    data_dir = os.path.expanduser('${DATA_DIR}')
-    for item in os.listdir(cache_path):
-        s, d = os.path.join(cache_path, item), os.path.join(data_dir, item)
-        shutil.copytree(s, d, dirs_exist_ok=True) if os.path.isdir(s) else shutil.copy2(s, d)
-    print('>> Đã copy sang:', data_dir)
-except Exception as e:
-    print('!! Lỗi kagglehub:', e, file=sys.stderr); sys.exit(1)
-"
+    echo ">> Kiểm tra truy cập dataset $KAGGLE_DATASET ..."
+    if ! LISTING="$(kaggle datasets files "$KAGGLE_DATASET" 2>&1)"; then
+        echo "$LISTING" | tail -5
+        echo "!! Không truy cập được dataset. Kiểm tra: KAGGLE_API_TOKEN đúng chưa, tên dataset đúng chưa, dataset đã Public chưa."
+        exit 1
+    fi
+    echo "$LISTING" | head -15      # xem nhanh dataset có file gì, dung lượng bao nhiêu
+    echo ">> Tải dataset $KAGGLE_DATASET về $DATA_DIR (có thể mất một lúc)..."
+    if ! download_dataset; then
+        echo "!! Cả 2 cách tải đều thất bại. Mở trang dataset trên Kaggle, tab Data, kiểm tra:"
+        echo "   (1) có hiển thị danh sách file và không còn trạng thái đang xử lý (processing);"
+        echo "   (2) thử bấm Download trên web. Nếu web cũng không tải được, hãy tạo lại version dataset"
+        echo "       hoặc chia nhỏ dataset thành vài file .zip (mỗi file vài GB) rồi upload lại."
+        exit 1
+    fi
     touch "$DATA_DIR/.downloaded"
 else
-    echo ">> Dữ liệu đã tải từ trước, bỏ qua."
+    echo ">> Dữ liệu đã tải từ trước ($DATA_DIR), bỏ qua."
+fi
+
+# Nếu nhãn còn nằm trong file .zip lồng bên trong dataset thì giải nén ra
+if [ -z "$(find "$DATA_DIR" -name '*.frame_data.json' -print -quit)" ]; then
+    echo ">> Chưa thấy *.frame_data.json, thử giải nén các file .zip trong dataset..."
+    find "$DATA_DIR" -name '*.zip' | while read -r z; do
+        python -m zipfile -e "$z" "$(dirname "$z")"
+    done
+fi
+
+N_LABEL=$(find "$DATA_DIR" -name '*.frame_data.json' | wc -l)
+N_IMG=$(find "$DATA_DIR" -name '*.png' | wc -l)
+echo ">> Tìm thấy: $N_LABEL file nhãn, $N_IMG ảnh png trong $DATA_DIR"
+if [ "$N_LABEL" -eq 0 ] || [ "$N_IMG" -eq 0 ]; then
+    echo "!! Không đủ nhãn/ảnh. Cấu trúc thư mục hiện có:"
+    find "$DATA_DIR" -maxdepth 3 | head -40
+    exit 1
+fi
+export DATA_DIR
+
+# Nếu train.py trên GitHub CHƯA phải bản mới (còn đọc ~/gdrive_mount) -> tạo symlink tương thích
+if ! grep -q 'environ.get("DATA_DIR"' "$SOURCE_DIR/train.py"; then
+    echo "!! train.py trên GitHub là bản cũ (đọc ~/gdrive_mount) -> tạo symlink tạm. Nên push bản train.py mới."
+    mkdir -p ~/gdrive_mount
+    [ -e ~/gdrive_mount/labels ] || ln -s "$DATA_DIR" ~/gdrive_mount/labels
+    [ -e ~/gdrive_mount/images ] || ln -s "$DATA_DIR" ~/gdrive_mount/images
 fi
 
 # ---------------------------------------------------------------------
