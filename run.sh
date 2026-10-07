@@ -53,7 +53,7 @@ mkdir -p "$DATA_DIR"
 # Lý do: "kaggle datasets files" chạy được nhưng lệnh tải CẢ dataset (DownloadDataset) có thể trả 404
 # (vd. dataset quá lớn / bản dataset chưa xử lý xong), nên cần đường dự phòng gọi thẳng REST API bằng curl.
 # Đếm file dữ liệu thật trong DATA_DIR (không tính file đánh dấu / file tạm của script)
-count_files() { find "$DATA_DIR" -type f ! -name '.downloaded' ! -name '_dataset.zip' ! -name '_filelist.txt' ! -name '.err_*' ! -name '_last_error.txt' ! -path '*/.cache/*' | wc -l; }
+count_files() { find "$DATA_DIR" -type f \( -name '*.zip' -o -name '*.png' -o -name '*.json' \) ! -name '_dataset.zip' ! -path '*/.cache/*' | wc -l; }
 has_data()    { [ "$(count_files)" -gt 0 ]; }
 
 # Nguồn dữ liệu hiện tại. File đánh dấu .downloaded ghi lại nguồn đã tải; nếu nguồn đổi
@@ -211,8 +211,11 @@ if [ -n "$HF_DATA_REPO" ] && [ ! -f "$DATA_DIR/.downloaded" ]; then
     export HF_XET_HIGH_PERFORMANCE=1
     hf download "$HF_DATA_REPO" --repo-type dataset --local-dir "$DATA_DIR" || true
     if ! has_data; then
-        echo "!! Không tải được từ Hugging Face dataset $HF_DATA_REPO."
-        echo "   Kiểm tra: HF_TOKEN có quyền đọc repo này chưa, tên repo đúng chưa (dạng TenTaiKhoan/ten-repo)."
+        echo "!! Hugging Face dataset $HF_DATA_REPO không có file dữ liệu (.zip/.png/.json). Các file đã tải về:"
+        find "$DATA_DIR" -type f ! -path '*/.cache/*' | head -10
+        echo "   Mở https://huggingface.co/datasets/$HF_DATA_REPO/tree/main kiểm tra repo đã có các file zip chưa."
+        echo "   Nếu chưa: chạy lại ô upload trong notebook Kaggle (cần Internet bật và secret HF_TOKEN)."
+        echo "   Nếu có rồi: kiểm tra HF_TOKEN có quyền đọc repo này và tên repo đúng (TenTaiKhoan/ten-repo)."
         exit 1
     fi
     echo "$SOURCE_ID" > "$DATA_DIR/.downloaded"
