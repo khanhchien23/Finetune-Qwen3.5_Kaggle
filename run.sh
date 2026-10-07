@@ -21,9 +21,6 @@ conda activate "$ENV_NAME"
 # Lý do: Python 3.10 của qwen_env chỉ cài được kaggle 1.7.x, bản này không hiểu token mới (KGAT_...)
 # và báo "KeyError: 'username'". Không đụng gì tới môi trường train.
 # kaggle_cli() { uv tool run --python 3.12 kaggle "$@"; }
-uv tool install --python 3.12 --force kaggle
-export PATH="$HOME/.local/bin:$PATH"
-hash -r
 # ---------------------------------------------------------------------
 # 2) Kiểm tra đăng nhập Kaggle / HF / wandb (thiếu cái nào dừng ngay, khỏi tải xong mới lỗi)
 # ---------------------------------------------------------------------
@@ -45,44 +42,29 @@ fi
 # ---------------------------------------------------------------------
 # 3) Tải dataset từ Kaggle (bỏ qua nếu đã tải xong từ lần trước)
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# 3) Tải dataset từ Kaggle (dùng kagglehub, bỏ qua nếu đã tải xong)
+# ---------------------------------------------------------------------
 mkdir -p "$DATA_DIR"
 if [ ! -f "$DATA_DIR/.downloaded" ]; then
-    echo ">> Kiểm tra truy cập dataset $KAGGLE_DATASET ..."
-    if ! kaggle datasets files "$KAGGLE_DATASET" >/dev/null; then
-        echo "!! Không truy cập được dataset. Kiểm tra: KAGGLE_API_TOKEN đúng chưa, tên dataset đúng chưa, dataset đã Public chưa."
-        exit 1
-    fi
-    echo ">> Tải dataset $KAGGLE_DATASET về $DATA_DIR (có thể mất một lúc)..."
-    kaggle datasets download -d "$KAGGLE_DATASET" -p "$DATA_DIR" --unzip
+    echo ">> Tải dataset $KAGGLE_DATASET bằng kagglehub..."
+    pip install -q kagglehub
+    python -c "
+import kagglehub, os, shutil, sys
+try:
+    cache_path = kagglehub.dataset_download('${KAGGLE_DATASET}')
+    print('>> Cache:', cache_path)
+    data_dir = os.path.expanduser('${DATA_DIR}')
+    for item in os.listdir(cache_path):
+        s, d = os.path.join(cache_path, item), os.path.join(data_dir, item)
+        shutil.copytree(s, d, dirs_exist_ok=True) if os.path.isdir(s) else shutil.copy2(s, d)
+    print('>> Đã copy sang:', data_dir)
+except Exception as e:
+    print('!! Lỗi kagglehub:', e, file=sys.stderr); sys.exit(1)
+"
     touch "$DATA_DIR/.downloaded"
 else
-    echo ">> Dữ liệu đã tải từ trước ($DATA_DIR), bỏ qua."
-fi
-
-# Nếu nhãn còn nằm trong file .zip lồng bên trong dataset thì giải nén ra
-if [ -z "$(find "$DATA_DIR" -name '*.frame_data.json' -print -quit)" ]; then
-    echo ">> Chưa thấy *.frame_data.json, thử giải nén các file .zip trong dataset..."
-    find "$DATA_DIR" -name '*.zip' | while read -r z; do
-        python -m zipfile -e "$z" "$(dirname "$z")"
-    done
-fi
-
-N_LABEL=$(find "$DATA_DIR" -name '*.frame_data.json' | wc -l)
-N_IMG=$(find "$DATA_DIR" -name '*.png' | wc -l)
-echo ">> Tìm thấy: $N_LABEL file nhãn, $N_IMG ảnh png trong $DATA_DIR"
-if [ "$N_LABEL" -eq 0 ] || [ "$N_IMG" -eq 0 ]; then
-    echo "!! Không đủ nhãn/ảnh. Cấu trúc thư mục hiện có:"
-    find "$DATA_DIR" -maxdepth 3 | head -40
-    exit 1
-fi
-export DATA_DIR
-
-# Nếu train.py trên GitHub CHƯA phải bản mới (còn đọc ~/gdrive_mount) -> tạo symlink tương thích
-if ! grep -q 'environ.get("DATA_DIR"' "$SOURCE_DIR/train.py"; then
-    echo "!! train.py trên GitHub là bản cũ (đọc ~/gdrive_mount) -> tạo symlink tạm. Nên push bản train.py mới."
-    mkdir -p ~/gdrive_mount
-    [ -e ~/gdrive_mount/labels ] || ln -s "$DATA_DIR" ~/gdrive_mount/labels
-    [ -e ~/gdrive_mount/images ] || ln -s "$DATA_DIR" ~/gdrive_mount/images
+    echo ">> Dữ liệu đã tải từ trước, bỏ qua."
 fi
 
 # ---------------------------------------------------------------------
