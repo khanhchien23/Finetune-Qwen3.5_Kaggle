@@ -62,7 +62,7 @@ max_seq_length = 16384 # Must be this long for VLMs
 lora_rank = 16 # Larger rank = smarter, but slower
 
 model, tokenizer = FastVisionModel.from_pretrained(
-    model_name = "unsloth/Qwen3.5-4B",
+    model_name = "unsloth/Qwen3.5-0.8B",
     max_seq_length = max_seq_length,
     load_in_4bit = False, # False for LoRA 16bit
     fast_inference = False, # Enable vllm fast inference
