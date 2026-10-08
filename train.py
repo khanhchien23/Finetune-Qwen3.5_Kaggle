@@ -28,7 +28,10 @@
 # In[2]:
 
 
-import os, glob, json
+import os, glob, json, time
+_T0 = time.time()
+def _tick(msg):
+    print(f"[timing] {msg}: {time.time() - _T0:.0f}s tổng kể từ lúc bắt đầu", flush=True)
 
 # Dữ liệu được run.sh tải từ Kaggle Dataset về máy (biến môi trường DATA_DIR, mặc định ~/kaggle_data).
 # Nhãn (*.frame_data.json) và ảnh (*.png) đều được tìm ĐỆ QUY trong DATA_DIR bên dưới,
@@ -51,9 +54,7 @@ assert img_index,  f"Không thấy ảnh *.png trong {IMG_DIR}"
 
 
 import os
-# Chỉ tắt torch.compile khi bị lỗi FX/dynamo (lỗi gốc xảy ra trên Kaggle 2 GPU). 1 GPU thì để bật cho nhanh.
-if os.environ.get("DISABLE_COMPILE", "0") == "1":
-    os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"   # tắt torch.compile của Unsloth, tránh lỗi FX/dynamo trên đa-GPU
 
 # In[4]:
 
@@ -64,7 +65,7 @@ max_seq_length = 16384 # Must be this long for VLMs
 lora_rank = 16 # Larger rank = smarter, but slower
 
 model, tokenizer = FastVisionModel.from_pretrained(
-    model_name = os.environ.get("MODEL_NAME", "unsloth/Qwen3.5-4B"),
+    model_name = "unsloth/Qwen3.5-4B",
     max_seq_length = max_seq_length,
     load_in_4bit = False, # False for LoRA 16bit
     fast_inference = False, # Enable vllm fast inference
@@ -101,6 +102,7 @@ model = FastVisionModel.get_peft_model(
 # In[6]:
 
 
+_tick("đã tải xong model")
 records, missing = [], 0
 for p in label_files:
     cap = json.load(open(p))["captures"][0]
@@ -115,6 +117,7 @@ print(f"usable samples: {len(records)} | skipped (no image): {missing}")
 
 CLASS_NAMES = sorted({r["answer"] for r in records})
 print("num classes:", len(CLASS_NAMES))
+_tick("đã đọc nhãn, tạo records")
 
 # Tách một phần nhỏ **giữ lại để đánh giá** (2 ảnh mỗi lớp), không dùng để train — để có số đo trước/sau train thật sự.
 
@@ -154,8 +157,13 @@ def resize_and_rgb(example):
     example["image"] = image
     return example
 
-train_dataset = train_dataset.map(resize_and_rgb)
-eval_dataset  = eval_dataset.map(resize_and_rgb)
+# Chạy song song nhiều tiến trình cho bước nặng nhất (giải mã PNG + resize + mã hóa lại).
+# Đặt DS_NUM_PROC=1 nếu gặp lỗi đa tiến trình; mặc định = số nhân CPU (tối đa 8).
+NUM_PROC = int(os.environ.get("DS_NUM_PROC", min(os.cpu_count() or 1, 8)))
+print("map resize với num_proc =", NUM_PROC)
+train_dataset = train_dataset.map(resize_and_rgb, num_proc=NUM_PROC)
+eval_dataset  = eval_dataset.map(resize_and_rgb, num_proc=NUM_PROC)
+_tick("xong bước resize ảnh")
 
 # We then create the conversational template that is needed to collate the dataset for RL:
 
@@ -192,8 +200,7 @@ def make_conversation(example):
     ]
     return {"prompt": prompt}   # 'image' và 'answer' giữ nguyên trong dataset
 
-train_dataset = train_dataset.map(make_conversation)
-eval_dataset  = eval_dataset.map(make_conversation)
+# (Không .map ở đây: prompt giống nhau cho mọi mẫu nên ở bước apply_template bên dưới chỉ cần thêm 1 cột.)
 
 # Now let's apply the chat template across the entire dataset:
 
@@ -209,8 +216,12 @@ def apply_template(example):
             enable_thinking = False,
         )
     }
-train_dataset = train_dataset.map(apply_template)
-eval_dataset  = eval_dataset.map(apply_template)
+# Prompt không phụ thuộc từng mẫu -> tạo MỘT lần rồi thêm thành cột, thay cho 2 lần .map
+# (mỗi lần .map phải giải mã lại toàn bộ ảnh). Kết quả giống hệt: cột "prompt" là chuỗi.
+_prompt_text = apply_template({"prompt": make_conversation({})["prompt"]})["prompt"]
+train_dataset = train_dataset.add_column("prompt", [_prompt_text] * len(train_dataset))
+eval_dataset  = eval_dataset.add_column("prompt", [_prompt_text] * len(eval_dataset))
+_tick("xong bước thêm prompt, sẵn sàng train")
 
 # Kiểm tra độ dài prompt (gồm cả token ảnh) phải < max_prompt_length ở cấu hình train bên dưới
 _ex = train_dataset[0]
@@ -323,40 +334,22 @@ os.environ["WANDB_PROJECT"] = "Finetune-Qwen3.5"  # <-- SỬA đúng tên projec
 
 
 from trl import GRPOConfig, GRPOTrainer
-
-# ---- Tham số ảnh hưởng tốc độ (đổi bằng biến môi trường, không cần sửa code) ----
-# Số ảnh mỗi bước = TRAIN_BATCH * GRAD_ACC / NUM_GEN.
-# Sinh text bằng HF generate bị giới hạn bởi độ trễ, nên tăng TRAIN_BATCH thường chỉ làm bước chậm hơn ít
-# nhưng xử lý được nhiều ảnh hơn. Tăng dần, xem VRAM bằng nvidia-smi (đừng để sát 100%).
-TRAIN_BATCH = int(os.environ.get("TRAIN_BATCH", 16))
-NUM_GEN     = int(os.environ.get("NUM_GEN", 8))
-GRAD_ACC    = int(os.environ.get("GRAD_ACC", 1))
-EPOCHS      = float(os.environ.get("EPOCHS", 1))     # mặc định train đúng 1 epoch
-MAX_STEPS   = int(os.environ.get("MAX_STEPS", -1))   # -1 = không giới hạn; đặt số dương (vd. 10) để chạy thử ngắn, sẽ ghi đè EPOCHS
-assert (TRAIN_BATCH * GRAD_ACC) % NUM_GEN == 0, "TRAIN_BATCH * GRAD_ACC phải chia hết cho NUM_GEN"
-_imgs_per_step = TRAIN_BATCH * GRAD_ACC // NUM_GEN
-_est_steps = MAX_STEPS if MAX_STEPS > 0 else int(-(-len(train_dataset) * EPOCHS // _imgs_per_step))
-print(f"[config] model={os.environ.get('MODEL_NAME', 'unsloth/Qwen3.5-4B')} | "
-      f"{_imgs_per_step} ảnh/bước, {NUM_GEN} completion/ảnh | {len(train_dataset)} ảnh train | "
-      f"epochs={EPOCHS} | ~{_est_steps} bước")
-
 training_args = GRPOConfig(
     learning_rate = 5e-6,
     adam_beta1 = 0.9,
     adam_beta2 = 0.99,
     weight_decay = 0.1,
-    warmup_steps = 20,   # trước đây warmup_ratio=0.1 => ~2.700 bước warmup khi chạy 27.760 bước
+    warmup_ratio = 0.1,
     lr_scheduler_type = "cosine",
     optim = "adamw_8bit",
     logging_steps = 1,
     log_completions = False,
-    per_device_train_batch_size = TRAIN_BATCH,
-    gradient_accumulation_steps = GRAD_ACC,
-    num_generations = NUM_GEN,
+    per_device_train_batch_size = 4,   # gốc; Unsloth tự nâng lên bằng num_generations
+    gradient_accumulation_steps = 1, # Increase to 4 for smoother training
+    num_generations = 4, # gốc; tăng lên 4 nếu muốn tín hiệu advantage bớt nhiễu và đủ VRAM
     max_prompt_length = 2048,
-    max_completion_length = 256,   # completion thực tế ~100-250 token; mỗi bước chờ completion dài nhất nên hạ trần để nhanh hơn
-    num_train_epochs = EPOCHS,
-    max_steps = MAX_STEPS,   # -1 => chạy đủ EPOCHS; số dương (chạy thử) thì ghi đè EPOCHS
+    max_completion_length = 384,
+    num_train_epochs = 2, # Set to 1 for a full training run - sẽ rất lâu, xem ghi chú markdown
     # max_steps = RESUME_TOTAL_STEPS,  # PHẢI > 480 (số bước đã chạy trong checkpoint),
     #                                   # nếu không Trainer nghĩ đã train xong và sẽ không chạy thêm
     save_strategy = "steps",
