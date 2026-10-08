@@ -8,7 +8,7 @@
 # **Tối ưu hóa so với bản gốc:**
 # 1. **Mapping dữ liệu**: dùng `batched=True` + `num_proc` → nhanh hơn 6–30 lần
 # 2. **Warmup**: dùng `warmup_steps=50` (cố định) thay vì `warmup_ratio=0.1` — với dataset 13k ảnh, ratio 0.1 sẽ lãng phí ~600 bước
-# 3. **Tham số huấn luyện**: tinh chỉnh cho NVIDIA L40S (48GB VRAM) — `TRAIN_BATCH=32, GRAD_ACC=1, NUM_GEN=8`
+# 3. **Tham số huấn luyện**: tinh chỉnh cho NVIDIA L40S (48GB VRAM) — `TRAIN_BATCH=96, GRAD_ACC=1, NUM_GEN=4`
 # 
 # **Bài toán:** mỗi ảnh có đúng 1 đối tượng; model phải trả về
 # - `<REASONING>...</REASONING>`: lập luận
@@ -125,7 +125,6 @@ train_dataset = Dataset.from_list(train_records).cast_column("image", HFImage())
 eval_dataset  = Dataset.from_list(eval_records).cast_column("image", HFImage())
 
 # #### ⚡ TỐI ƯU HÓA: Resize ảnh theo lô + đa tiến trình
-# Thay vì `.map()` từng mẫu, dùng `batched=True` + `batch_size=32` + `num_proc` để xử lý song song nhiều ảnh. Theo tài liệu HuggingFace, cách này nhanh hơn **6–30 lần** so với xử lý tuần tự.
 
 # In[7]:
 
@@ -265,25 +264,7 @@ def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[floa
 
 # ### Train the model
 # 
-# #### ⚡ Tham số tối ưu cho NVIDIA L40S (48GB VRAM) + dataset 13k ảnh
-# 
-# **Thay đổi quan trọng so với bản trước:**
-# - `warmup_ratio=0.1` → **`warmup_steps=50`** — với 13k ảnh (~1.600–6.500 bước/epoch tuỳ batch size), ratio 0.1 sẽ lãng phí 160–650 bước warmup. GRPO có LR rất nhỏ (5e-6) nên chỉ cần 50 bước.
-# - `TRAIN_BATCH=8, GRAD_ACC=2` → **`TRAIN_BATCH=32, GRAD_ACC=1`** — tăng throughput gấp 4 lần, giảm số bước/epoch từ 6.500 → 1.625.
-# 
-# | Tham số | Bản trước | **Bản này** | Lý do |
-# |---|---|---|---|
-# | `per_device_train_batch_size` | 8 | **32** | Tận dụng 48GB VRAM của L40S |
-# | `gradient_accumulation_steps` | 2 | **1** | Batch hiệu dụng vẫn = 32 |
-# | `warmup_ratio=0.1` | 0.1 | — | Bỏ (lãng phí với dataset lớn) |
-# | `warmup_steps` | — | **50** | Cố định, không phụ thuộc số bước |
-# | `optim` | `adamw_torch_fused` | `adamw_torch_fused` | Giữ nguyên |
-# 
-# **Điều chỉnh qua biến môi trường** (không cần sửa code):
-# ```bash
-# TRAIN_BATCH=32 GRAD_ACC=1 NUM_GEN=8 WARMUP_STEPS=50 EPOCHS=1 python train.py
-# MAX_STEPS=1500 python train.py   # chạy thử giới hạn trong 1 phiên Kaggle
-# ```
+# #### ⚡ Tham số tối ưu cho NVIDIA L40S (48GB VRAM) + NUM_GEN=4
 
 # In[11]:
 
@@ -293,20 +274,13 @@ os.environ["WANDB_PROJECT"] = "Finetune-Qwen3.5"  # <-- SỬA đúng tên projec
 
 from trl import GRPOConfig, GRPOTrainer
 
-# ---- Tham số ảnh hưởng tốc độ (đổi bằng biến môi trường, không cần sửa code) ----
-# Số ảnh mỗi bước = TRAIN_BATCH * GRAD_ACC / NUM_GEN.
-# L40S 48GB + dataset 13k ảnh: TRAIN_BATCH=32, GRAD_ACC=1, NUM_GEN=8 => 4 ảnh/bước.
-# Nếu VRAM còn dư (kiểm tra nvidia-smi), có thể tăng TRAIN_BATCH lên 48 hoặc 64.
-# Nếu OOM, giảm TRAIN_BATCH xuống 16 và tăng GRAD_ACC lên 2.
-TRAIN_BATCH = int(os.environ.get("TRAIN_BATCH", 32))
-NUM_GEN     = int(os.environ.get("NUM_GEN", 8))
+# ---- Tham số tối ưu cho L40S (48GB VRAM) + NUM_GEN=4 ----
+# Mục tiêu: dùng ~40-45GB VRAM. Nếu OOM, giảm TRAIN_BATCH xuống 64.
+TRAIN_BATCH = int(os.environ.get("TRAIN_BATCH", 96))
+NUM_GEN     = int(os.environ.get("NUM_GEN", 4))
 GRAD_ACC    = int(os.environ.get("GRAD_ACC", 1))
-EPOCHS      = float(os.environ.get("EPOCHS", 1))     # dataset lớn -> 1 epoch thường đủ cho GRPO
-MAX_STEPS   = int(os.environ.get("MAX_STEPS", -1))   # -1 = không giới hạn; đặt số dương để chạy thử
-
-# ---- Warmup: dùng absolute steps thay vì ratio ----
-# Dataset 13k ảnh với TRAIN_BATCH=32 -> ~1.600 bước/epoch.
-# warmup_ratio=0.1 sẽ là 160 bước -> lãng phí. GRPO có LR nhỏ (5e-6) nên chỉ cần warmup rất ngắn.
+EPOCHS      = float(os.environ.get("EPOCHS", 1))
+MAX_STEPS   = int(os.environ.get("MAX_STEPS", -1))
 WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", 50))
 
 assert (TRAIN_BATCH * GRAD_ACC) % NUM_GEN == 0, "TRAIN_BATCH * GRAD_ACC phải chia hết cho NUM_GEN"
@@ -322,21 +296,21 @@ training_args = GRPOConfig(
     adam_beta1 = 0.9,
     adam_beta2 = 0.99,
     weight_decay = 0.1,
-    warmup_steps = WARMUP_STEPS,     # ✅ 50 bước cố định (thay cho warmup_ratio=0.1)
+    warmup_steps = WARMUP_STEPS,
     lr_scheduler_type = "cosine",
-    optim = "adamw_torch_fused",     # ⚡ Tối ưu cho L40S (fused AdamW)
+    optim = "adamw_torch_fused",
     max_grad_norm = 0.1,
 
     # ===== Batch & Generation =====
-    per_device_train_batch_size = TRAIN_BATCH,
+    per_device_train_batch_size = TRAIN_BATCH,   # 96 (L40S 48GB)
     gradient_accumulation_steps = GRAD_ACC,
-    num_generations = NUM_GEN,
+    num_generations = NUM_GEN,                   # 4 (theo yêu cầu)
     max_prompt_length = 2048,
-    max_completion_length = 384,     # L40S đủ mạnh để sinh completion dài hơn
+    max_completion_length = 512,                 # Tăng từ 384 -> 512 để dùng thêm VRAM
 
     # ===== Training schedule =====
     num_train_epochs = EPOCHS,
-    max_steps = MAX_STEPS,           # -1 => chạy đủ EPOCHS; số dương (chạy thử) thì ghi đè EPOCHS
+    max_steps = MAX_STEPS,
     logging_steps = 1,
 
     # ===== Checkpointing =====
@@ -353,7 +327,7 @@ training_args = GRPOConfig(
     hub_private_repo = True,
     output_dir = "outputs",
 
-    # ===== GSPO (giữ nguyên từ notebook gốc) =====
+    # ===== GSPO =====
     importance_sampling_level = "sequence",
     mask_truncated_completions = False,
     loss_type = "dr_grpo",
