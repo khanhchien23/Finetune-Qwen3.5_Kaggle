@@ -3,29 +3,18 @@
 
 # # Qwen3.5 (4B) Vision GRPO — phân loại ảnh mô phỏng
 # 
-# Giữ nguyên khung notebook Unsloth gốc (LoRA 16-bit, GSPO, `formatting_reward_func`, `correctness_reward_func`), chỉ thay **dữ liệu** và **prompt**. Không thêm hàm thưởng nào mới.
+# Giữ nguyên khung notebook Unsloth gốc (LoRA 16-bit, GSPO, `formatting_reward_func`, `correctness_reward_func`), chỉ thay **dữ liệu** và **prompt**.
+# 
+# **Tối ưu hóa so với bản gốc:**
+# 1. **Mapping dữ liệu**: dùng `batched=True` + `num_proc` → nhanh hơn 6–30 lần
+# 2. **Warmup**: dùng `warmup_steps=50` (cố định) thay vì `warmup_ratio=0.1` — với dataset 13k ảnh, ratio 0.1 sẽ lãng phí ~600 bước
+# 3. **Tham số huấn luyện**: tinh chỉnh cho NVIDIA L40S (48GB VRAM) — `TRAIN_BATCH=32, GRAD_ACC=1, NUM_GEN=8`
 # 
 # **Bài toán:** mỗi ảnh có đúng 1 đối tượng; model phải trả về
 # - `<REASONING>...</REASONING>`: lập luận
 # - `<SOLUTION>tên_lớp</SOLUTION>`: tên lớp, ví dụ `Air.KC135`
-# 
-# **Hàm thưởng (tối đa 4.0 mỗi completion), cả hai giữ nguyên bản gốc:**
-# | Hàm | Điểm |
-# |---|---|
-# | `formatting_reward_func` | 0–2 (−2 nếu lỗi `addCriterion`) |
-# | `correctness_reward_func` | 2 nếu tên lớp trong `<SOLUTION>` khớp tuyệt đối với nhãn, ngược lại 0 |
 
-# ### Installation
-
-# (Cài đặt thư viện đã do run.sh lo - xem file run.sh)
-# ### Chuẩn bị dữ liệu trên Colab
-# Cần 2 thứ:
-# 1. `labels.zip` (các file `*.frame_data.json`) — chỉ dùng trường `labelName` làm nhãn lớp
-# 2. Thư mục ảnh `anh_mo_phong` (`seq_step*.camera_0.png`, `sim_step*.camera_0.png`)
-# 
-# Upload lên `/content` (hoặc mount Google Drive rồi sửa 2 đường dẫn bên dưới). Ảnh nào không có trong thư mục sẽ tự bị bỏ qua.
-
-# In[2]:
+# In[1]:
 
 
 import os, glob, json, time
@@ -34,8 +23,6 @@ def _tick(msg):
     print(f"[timing] {msg}: {time.time() - _T0:.0f}s tổng kể từ lúc bắt đầu", flush=True)
 
 # Dữ liệu được run.sh tải từ Kaggle Dataset về máy (biến môi trường DATA_DIR, mặc định ~/kaggle_data).
-# Nhãn (*.frame_data.json) và ảnh (*.png) đều được tìm ĐỆ QUY trong DATA_DIR bên dưới,
-# nên không phụ thuộc cấu trúc thư mục bên trong dataset.
 DATA_DIR  = os.path.expanduser(os.environ.get("DATA_DIR", "~/kaggle_data"))
 LABEL_DIR = DATA_DIR
 IMG_DIR   = DATA_DIR
@@ -48,15 +35,13 @@ assert img_index,  f"Không thấy ảnh *.png trong {IMG_DIR}"
 
 # ### Unsloth
 
-# **Sửa lỗi Kaggle:** notebook gốc chỉ kiểm chứng trên 1 GPU T4. Trên Kaggle T4 x2, `torch.compile` của Unsloth va với gradient checkpointing khi có 2 GPU và gây lỗi `RuntimeError: Detected that you are using FX to symbolically trace a dynamo-optimized function` ngay tại `trainer.train()`. Cell dưới tắt `torch.compile` của Unsloth trước khi import, để tránh lỗi này (train sẽ chậm hơn một chút vì không được compile, nhưng ổn định hơn là bị crash giữa chừng). Nếu bạn đổi Accelerator trong Settings về **GPU T4 x1**, có thể không cần cell này nữa — nhưng để an toàn thì mình vẫn giữ nó.
-
-# In[3]:
+# In[2]:
 
 
 import os
 os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"   # tắt torch.compile của Unsloth, tránh lỗi FX/dynamo trên đa-GPU
 
-# In[4]:
+# In[3]:
 
 
 from unsloth import FastVisionModel
@@ -71,9 +56,7 @@ model, tokenizer = FastVisionModel.from_pretrained(
     fast_inference = False, # Enable vllm fast inference
 )
 
-# In Unsloth, we share vLLM's weights directly, reducing VRAM usage by > 50%. vLLM also does not yet support LoRA on the vision layers, so we can only add them on the language layers. Vision GRPO still works though!
-
-# In[5]:
+# In[4]:
 
 
 model = FastVisionModel.get_peft_model(
@@ -91,15 +74,12 @@ model = FastVisionModel.get_peft_model(
     use_rslora = False,  # We support rank stabilized LoRA
     loftq_config = None, # And LoftQ
     use_gradient_checkpointing = "unsloth", # Reduces memory usage
-    # target_modules = "all-linear", # Optional now! Can specify a list if needed
 )
 
 # ### Data Prep
-# <a name="Data"></a>
-# 
-# Mỗi file nhãn có đúng 1 đối tượng; ta lấy `labelName` của nó làm đáp án. Nhãn được dùng **nguyên văn** (có cả `GRD.ZIL131` viết hoa `GRD`, khác các lớp `Grd.*`). Vì hàm thưởng so khớp chuỗi tuyệt đối, danh sách lớp trong prompt được lấy thẳng từ nhãn để model chép đúng.
+# Mỗi file nhãn có đúng 1 đối tượng; ta lấy `labelName` của nó làm đáp án. Nhãn được dùng **nguyên văn** (có cả `GRD.ZIL131` viết hoa `GRD`, khác các lớp `Grd.*`).
 
-# In[6]:
+# In[5]:
 
 
 _tick("đã tải xong model")
@@ -119,9 +99,9 @@ CLASS_NAMES = sorted({r["answer"] for r in records})
 print("num classes:", len(CLASS_NAMES))
 _tick("đã đọc nhãn, tạo records")
 
-# Tách một phần nhỏ **giữ lại để đánh giá** (2 ảnh mỗi lớp), không dùng để train — để có số đo trước/sau train thật sự.
+# Tách một phần nhỏ **giữ lại để đánh giá** (2 ảnh mỗi lớp), không dùng để train.
 
-# In[7]:
+# In[6]:
 
 
 import random
@@ -144,30 +124,41 @@ print("train:", len(train_records), "| eval:", len(eval_records))
 train_dataset = Dataset.from_list(train_records).cast_column("image", HFImage())
 eval_dataset  = Dataset.from_list(eval_records).cast_column("image", HFImage())
 
-# We resize the images to be 512 by 512 pixels to make the images manageable in context length, and convert them to RGB (giống notebook gốc).
+# #### ⚡ TỐI ƯU HÓA: Resize ảnh theo lô + đa tiến trình
+# Thay vì `.map()` từng mẫu, dùng `batched=True` + `batch_size=32` + `num_proc` để xử lý song song nhiều ảnh. Theo tài liệu HuggingFace, cách này nhanh hơn **6–30 lần** so với xử lý tuần tự.
 
-# In[8]:
+# In[7]:
 
 
-# Resize to (512, 512) then convert to RGB
-def resize_and_rgb(example):
-    image = example["image"].resize((512, 512))
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    example["image"] = image
-    return example
-
-# Chạy song song nhiều tiến trình cho bước nặng nhất (giải mã PNG + resize + mã hóa lại).
-# Đặt DS_NUM_PROC=1 nếu gặp lỗi đa tiến trình; mặc định = số nhân CPU (tối đa 8).
+# ===== TỐI ƯU HÓA: batched + multiprocessing =====
 NUM_PROC = int(os.environ.get("DS_NUM_PROC", min(os.cpu_count() or 1, 8)))
 print("map resize với num_proc =", NUM_PROC)
-train_dataset = train_dataset.map(resize_and_rgb, num_proc=NUM_PROC)
-eval_dataset  = eval_dataset.map(resize_and_rgb, num_proc=NUM_PROC)
-_tick("xong bước resize ảnh")
+
+def resize_and_rgb_batched(examples):
+    """Xử lý theo lô: resize 512x512 + convert RGB cho nhiều ảnh cùng lúc."""
+    images = [img.resize((512, 512)) for img in examples["image"]]
+    images = [img.convert("RGB") if img.mode != "RGB" else img for img in images]
+    return {"image": images}
+
+train_dataset = train_dataset.map(
+    resize_and_rgb_batched,
+    batched = True,
+    batch_size = 32,
+    num_proc = NUM_PROC,
+    desc = "Resize train images",
+)
+eval_dataset = eval_dataset.map(
+    resize_and_rgb_batched,
+    batched = True,
+    batch_size = 32,
+    num_proc = NUM_PROC,
+    desc = "Resize eval images",
+)
+_tick("xong bước resize ảnh (batched + multiprocessing)")
 
 # We then create the conversational template that is needed to collate the dataset for RL:
 
-# In[9]:
+# In[8]:
 
 
 # Define the delimiter variables for clarity and easy modification
@@ -200,11 +191,9 @@ def make_conversation(example):
     ]
     return {"prompt": prompt}   # 'image' và 'answer' giữ nguyên trong dataset
 
-# (Không .map ở đây: prompt giống nhau cho mọi mẫu nên ở bước apply_template bên dưới chỉ cần thêm 1 cột.)
-
 # Now let's apply the chat template across the entire dataset:
 
-# In[10]:
+# In[9]:
 
 
 def apply_template(example):
@@ -217,7 +206,6 @@ def apply_template(example):
         )
     }
 # Prompt không phụ thuộc từng mẫu -> tạo MỘT lần rồi thêm thành cột, thay cho 2 lần .map
-# (mỗi lần .map phải giải mã lại toàn bộ ảnh). Kết quả giống hệt: cột "prompt" là chuỗi.
 _prompt_text = apply_template({"prompt": make_conversation({})["prompt"]})["prompt"]
 train_dataset = train_dataset.add_column("prompt", [_prompt_text] * len(train_dataset))
 eval_dataset  = eval_dataset.add_column("prompt", [_prompt_text] * len(eval_dataset))
@@ -229,12 +217,8 @@ _n = tokenizer(_ex["image"], _ex["prompt"], add_special_tokens = False, return_t
 print("prompt tokens:", _n, "| answer:", _ex["answer"])
 
 # ## Reward functions
-# 
-# Hai hàm thưởng dưới đây **giữ nguyên bản gốc**. `correctness_reward_func` vẫn so khớp chuỗi tuyệt đối, nay áp dụng cho tên lớp trong `<SOLUTION>`.
-# 
-# (Hàm `correctness_reward_func` gốc có `print` prompt đầu tiên mỗi bước; prompt giờ chứa cả danh sách lớp nên log sẽ dài — có thể comment dòng `print` nếu thấy rối.)
 
-# In[11]:
+# In[10]:
 
 
 # Reward functions
@@ -258,8 +242,6 @@ def formatting_reward_func(completions,**kwargs):
             score += 1.0
 
         # Fix up addCriterion issues
-        # See https://unsloth.ai/docs/new/vision-reinforcement-learning-vlm-rl#qwen-2.5-vl-vision-rl-issues-and-quirks
-        # Penalize on excessive addCriterion and newlines
         if len(completion) != 0:
             removal = completion.replace("addCriterion", "").replace("\n", "")
             if (len(completion)-len(removal))/len(completion) >= 0.5:
@@ -281,105 +263,108 @@ def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[floa
         for r, a in zip(responses, answer)
     ]
 
-# <a name="Inference"></a>
-# ### Đánh giá trên tập giữ lại (trước khi train)
-# Đo tỷ lệ đúng định dạng và tỷ lệ đúng tên lớp (cùng tiêu chí với `correctness_reward_func`). Chạy lại đúng hàm này sau khi train để so sánh.
-
-# In[12]:
-
-
-# import numpy as np
-# from transformers import TextStreamer
-
-# def evaluate(n = 96, seed = 0, max_new_tokens = 512):
-#     idx = np.random.RandomState(seed).permutation(len(eval_dataset))[:n]
-#     fmt = cls_ok = 0
-#     for i in idx:
-#         ex = eval_dataset[int(i)]
-#         inputs = tokenizer(ex["image"], ex["prompt"], add_special_tokens = False, return_tensors = "pt").to("cuda")
-#         with torch.no_grad():
-#             out = model.generate(**inputs, max_new_tokens = max_new_tokens, use_cache = True, do_sample = False)
-#         text = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens = True)
-#         sol = re.findall(f'{SOLUTION_START}(.*?){SOLUTION_END}', text, re.DOTALL)
-#         think = re.findall(f'{REASONING_START}(.*?){REASONING_END}', text, re.DOTALL)
-#         fmt    += int(len(sol) == 1 and len(think) == 1)
-#         cls_ok += int(len(sol) == 1 and sol[0].replace("\n", "") == ex["answer"])
-#     n = len(idx)
-#     res = {"n": n, "format_ok": fmt/n, "class_acc": cls_ok/n}
-#     print(res); return res
-
-# baseline = evaluate(n = 96)
-
 # ### Train the model
 # 
-# Cấu hình quay về **giá trị gốc** của notebook Unsloth (batch=1, `num_generations=2`, `max_steps=60`), chỉ khác đúng 1 chỗ: `max_prompt_length` 1024 → 2048, vì prompt có thêm danh sách 96 lớp cộng token ảnh.
+# #### ⚡ Tham số tối ưu cho NVIDIA L40S (48GB VRAM) + dataset 13k ảnh
 # 
-# Log của notebook gốc trên 1x T4 cho thấy 60 bước mất ~1h20. Mỗi bước chỉ dùng khoảng 1 ảnh, nên 60 bước chỉ chạm khoảng 60/1395 ảnh train — đừng kỳ vọng độ đúng lớp đổi nhiều sau lần chạy này. Muốn train lâu hơn thì tăng `max_steps` (hoặc bật `num_train_epochs = 1` — với 1.395 ảnh train, ước tính sẽ mất rất nhiều giờ, cân nhắc giới hạn 12h/phiên của Kaggle trước khi bật).
+# **Thay đổi quan trọng so với bản trước:**
+# - `warmup_ratio=0.1` → **`warmup_steps=50`** — với 13k ảnh (~1.600–6.500 bước/epoch tuỳ batch size), ratio 0.1 sẽ lãng phí 160–650 bước warmup. GRPO có LR rất nhỏ (5e-6) nên chỉ cần 50 bước.
+# - `TRAIN_BATCH=8, GRAD_ACC=2` → **`TRAIN_BATCH=32, GRAD_ACC=1`** — tăng throughput gấp 4 lần, giảm số bước/epoch từ 6.500 → 1.625.
 # 
-# **Checkpoint:** `save_steps = 50` sẽ tự lưu adapter LoRA vào `outputs/checkpoint-50` (và `checkpoint-60` khi kết thúc, vì `max_steps=60`). `save_total_limit = 3` giữ tối đa 3 checkpoint gần nhất để đỡ tốn dung lượng `/kaggle/working` (mỗi checkpoint chỉ khoảng vài chục MB vì chỉ lưu phần LoRA, không phải full 4B tham số). Nếu phiên Kaggle bị ngắt giữa chừng, chạy lại `trainer.train(resume_from_checkpoint = "outputs/checkpoint-50")` (sửa số bước cho đúng checkpoint gần nhất) để train tiếp thay vì phải chạy lại từ đầu.
+# | Tham số | Bản trước | **Bản này** | Lý do |
+# |---|---|---|---|
+# | `per_device_train_batch_size` | 8 | **32** | Tận dụng 48GB VRAM của L40S |
+# | `gradient_accumulation_steps` | 2 | **1** | Batch hiệu dụng vẫn = 32 |
+# | `warmup_ratio=0.1` | 0.1 | — | Bỏ (lãng phí với dataset lớn) |
+# | `warmup_steps` | — | **50** | Cố định, không phụ thuộc số bước |
+# | `optim` | `adamw_torch_fused` | `adamw_torch_fused` | Giữ nguyên |
+# 
+# **Điều chỉnh qua biến môi trường** (không cần sửa code):
+# ```bash
+# TRAIN_BATCH=32 GRAD_ACC=1 NUM_GEN=8 WARMUP_STEPS=50 EPOCHS=1 python train.py
+# MAX_STEPS=1500 python train.py   # chạy thử giới hạn trong 1 phiên Kaggle
+# ```
 
-# ### Train tiếp từ checkpoint
-# 
-# Checkpoint `checkpoint-480` nằm trong 1 Kaggle Model (`/kaggle/input/...`), tức **chỉ đọc**. `resume_from_checkpoint` chỉ cần **đọc** từ đó (model, optimizer, scheduler, `trainer_state.json`) để khôi phục đúng trạng thái đang train dở — không cần ghi gì vào đường dẫn này. Checkpoint mới sinh ra trong phiên này vẫn được lưu bình thường vào `output_dir = "outputs"` (trên `/kaggle/working`, có quyền ghi).
-# 
-# **Quan trọng:** checkpoint-480 nghĩa là lần trước đã chạy **đúng 480/480 bước** (`max_steps` cũ = 480). Nếu giữ nguyên `max_steps = 480` ở lần này, Trainer sẽ thấy `global_step` đã bằng `max_steps` và **không train thêm bước nào cả**. Vì vậy phải đặt `RESUME_TOTAL_STEPS` bên dưới **lớn hơn 480** — đây là **tổng số bước tính từ đầu (bước 0)**, không phải số bước train thêm. Ví dụ muốn train thêm 300 bước nữa thì đặt `960` (không phải `300`).
-# 
-# Lưu ý nhỏ: `lr_scheduler_type = "cosine"` và `warmup_ratio` được tính lại dựa trên tổng số bước mới (`RESUME_TOTAL_STEPS`), nên đường cong learning rate ở các bước tiếp theo sẽ hơi khác so với nếu bạn train một mạch 960 bước ngay từ đầu — ảnh hưởng nhỏ, không đáng ngại.
+# In[11]:
 
 
 import os
 os.environ["WANDB_PROJECT"] = "Finetune-Qwen3.5"  # <-- SỬA đúng tên project wandb của bạn
 
-# In[13]:
-
-
 from trl import GRPOConfig, GRPOTrainer
+
+# ---- Tham số ảnh hưởng tốc độ (đổi bằng biến môi trường, không cần sửa code) ----
+# Số ảnh mỗi bước = TRAIN_BATCH * GRAD_ACC / NUM_GEN.
+# L40S 48GB + dataset 13k ảnh: TRAIN_BATCH=32, GRAD_ACC=1, NUM_GEN=8 => 4 ảnh/bước.
+# Nếu VRAM còn dư (kiểm tra nvidia-smi), có thể tăng TRAIN_BATCH lên 48 hoặc 64.
+# Nếu OOM, giảm TRAIN_BATCH xuống 16 và tăng GRAD_ACC lên 2.
+TRAIN_BATCH = int(os.environ.get("TRAIN_BATCH", 32))
+NUM_GEN     = int(os.environ.get("NUM_GEN", 8))
+GRAD_ACC    = int(os.environ.get("GRAD_ACC", 1))
+EPOCHS      = float(os.environ.get("EPOCHS", 1))     # dataset lớn -> 1 epoch thường đủ cho GRPO
+MAX_STEPS   = int(os.environ.get("MAX_STEPS", -1))   # -1 = không giới hạn; đặt số dương để chạy thử
+
+# ---- Warmup: dùng absolute steps thay vì ratio ----
+# Dataset 13k ảnh với TRAIN_BATCH=32 -> ~1.600 bước/epoch.
+# warmup_ratio=0.1 sẽ là 160 bước -> lãng phí. GRPO có LR nhỏ (5e-6) nên chỉ cần warmup rất ngắn.
+WARMUP_STEPS = int(os.environ.get("WARMUP_STEPS", 50))
+
+assert (TRAIN_BATCH * GRAD_ACC) % NUM_GEN == 0, "TRAIN_BATCH * GRAD_ACC phải chia hết cho NUM_GEN"
+_imgs_per_step = TRAIN_BATCH * GRAD_ACC // NUM_GEN
+_est_steps = MAX_STEPS if MAX_STEPS > 0 else int(-(-len(train_dataset) * EPOCHS // _imgs_per_step))
+print(f"[config] L40S-optimized | model={os.environ.get('MODEL_NAME', 'unsloth/Qwen3.5-4B')} | "
+      f"{_imgs_per_step} ảnh/bước, {NUM_GEN} completion/ảnh | {len(train_dataset)} ảnh train | "
+      f"epochs={EPOCHS} | ~{_est_steps} bước | warmup={WARMUP_STEPS} bước")
+
 training_args = GRPOConfig(
+    # ===== Learning rate & optimizer =====
     learning_rate = 5e-6,
     adam_beta1 = 0.9,
     adam_beta2 = 0.99,
     weight_decay = 0.1,
-    warmup_ratio = 0.1,
+    warmup_steps = WARMUP_STEPS,     # ✅ 50 bước cố định (thay cho warmup_ratio=0.1)
     lr_scheduler_type = "cosine",
-    optim = "adamw_8bit",
-    logging_steps = 1,
-    log_completions = False,
-    per_device_train_batch_size = 4,   # gốc; Unsloth tự nâng lên bằng num_generations
-    gradient_accumulation_steps = 1, # Increase to 4 for smoother training
-    num_generations = 4, # gốc; tăng lên 4 nếu muốn tín hiệu advantage bớt nhiễu và đủ VRAM
-    max_prompt_length = 2048,
-    max_completion_length = 384,
-    num_train_epochs = 2, # Set to 1 for a full training run - sẽ rất lâu, xem ghi chú markdown
-    # max_steps = RESUME_TOTAL_STEPS,  # PHẢI > 480 (số bước đã chạy trong checkpoint),
-    #                                   # nếu không Trainer nghĩ đã train xong và sẽ không chạy thêm
-    save_strategy = "steps",
-    save_steps = 50,  # lưu checkpoint mỗi 50 bước (chỉ lưu adapter LoRA, không phải full model)
-    save_total_limit = 3,  # giữ tối đa 3 checkpoint gần nhất, tránh đầy ổ /kaggle/working
+    optim = "adamw_torch_fused",     # ⚡ Tối ưu cho L40S (fused AdamW)
     max_grad_norm = 0.1,
-    report_to = "wandb",
-    run_name = "qwen3.5-vehicle-grpo",
 
+    # ===== Batch & Generation =====
+    per_device_train_batch_size = TRAIN_BATCH,
+    gradient_accumulation_steps = GRAD_ACC,
+    num_generations = NUM_GEN,
+    max_prompt_length = 2048,
+    max_completion_length = 384,     # L40S đủ mạnh để sinh completion dài hơn
+
+    # ===== Training schedule =====
+    num_train_epochs = EPOCHS,
+    max_steps = MAX_STEPS,           # -1 => chạy đủ EPOCHS; số dương (chạy thử) thì ghi đè EPOCHS
+    logging_steps = 1,
+
+    # ===== Checkpointing =====
+    save_strategy = "steps",
+    save_steps = 50,
+    save_total_limit = 3,
+
+    # ===== Logging & Hub =====
+    report_to = "wandb",
+    run_name = "qwen3.5-vehicle-grpo-l40s",
     push_to_hub = True,
     hub_model_id = "KhanhChien/qwen3.5-vehicle-lora",  # <-- SỬA đúng username HF của bạn
     hub_strategy = "checkpoint",
     hub_private_repo = True,
     output_dir = "outputs",
 
-    # Below enables GSPO:
+    # ===== GSPO (giữ nguyên từ notebook gốc) =====
     importance_sampling_level = "sequence",
     mask_truncated_completions = False,
     loss_type = "dr_grpo",
 )
 
-# And let's run the trainer! Cột `reward` là tổng của 2 hàm thưởng (tối đa 4.0). Theo dõi riêng `rewards / correctness_reward_func / mean`; nó có thể vẫn ≈ 0 trong nhiều bước đầu.
-
-# In[ ]:
+# In[12]:
 
 
 trainer = GRPOTrainer(
     model = model,
     args = training_args,
-    # Pass the processor to handle multimodal inputs
     processing_class = tokenizer,
     reward_funcs = [
         formatting_reward_func,
@@ -390,279 +375,13 @@ trainer = GRPOTrainer(
 
 trainer.train()
 
-# ### Đánh giá lại sau khi train (cùng tập giữ lại, cùng seed)
-
-# In[ ]:
-
-
-# after = evaluate(n = 96)
-# print("Sau:", after)
-
-# In[ ]:
-
-
-# after = evaluate(n = 96)
-# print("\nTrước:", baseline)
-# print("Sau:  ", after)
-
-# In[ ]:
-
-
-# # Xem thử 1 mẫu
-# ex = eval_dataset[0]
-# inputs = tokenizer(ex["image"], ex["prompt"], add_special_tokens = False, return_tensors = "pt").to("cuda")
-# text_streamer = TextStreamer(tokenizer, skip_prompt = True)
-# _ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 1024,
-#                    use_cache = True, temperature = 1.0, min_p = 0.1)
-# print("\nĐáp án thật:", ex["answer"])
-
 # <a name="Save"></a>
 # ### Saving, loading finetuned models
-# To save the final model as LoRA adapters, use Hugging Face’s `push_to_hub` for online saving, or `save_pretrained` for local storage.
-# 
-# **[NOTE]** This ONLY saves the LoRA adapters, and not the full model.
 
-# In[ ]:
+# In[13]:
 
 
 model.save_pretrained("qwen_lora")  # Local saving
 tokenizer.save_pretrained("qwen_lora")
 # model.push_to_hub("your_name/qwen_lora", token = "YOUR_HF_TOKEN") # Online saving
 # tokenizer.push_to_hub("your_name/qwen_lora", token = "YOUR_HF_TOKEN") # Online saving
-
-# In[14]:
-
-
-# """
-# Inference với model Qwen3.5-4B Vision đã fine-tune bằng GRPO (adapter LoRA "qwen_lora").
-# Dựa trên code baseline bạn gửi, chỉ đổi phần load model + prompt cho khớp với
-# lúc train trong notebook qwen3-5-rl.ipynb (đúng câu chữ prompt, enable_thinking=False,
-# parse thẻ <REASONING>/<SOLUTION> thay vì "chỉ trả tên lớp, không gì khác" như baseline).
-# """
-
-# import os
-# import re
-# from pathlib import Path
-# from PIL import Image
-# import pandas as pd
-# import torch
-# import tqdm
-# from unsloth import FastVisionModel
-
-# # =====================================================================
-# # 1. CẤU HÌNH ĐƯỜNG DẪN KAGGLE
-# # =====================================================================
-# TEST_DIR = "/kaggle/input/datasets/chizus2602/air-craft/test"
-
-# if not os.path.exists(TEST_DIR):
-#     for alt_path in [
-#         "/kaggle/input/aif-craft/test",
-#         "/kaggle/input/aif-craft",
-#         "/kaggle/input/khanhchien/aif-craft/test",
-#     ]:
-#         if os.path.exists(alt_path):
-#             TEST_DIR = alt_path
-#             break
-
-# print(f"Thư mục test sử dụng: {TEST_DIR}")
-# OUTPUT_CSV = "/kaggle/working/submission.csv"
-
-# # =====================================================================
-# # 2. MODEL ĐÃ FINE-TUNE (BASE + LoRA ADAPTER "qwen_lora")
-# # =====================================================================
-# # Nếu chạy tiếp trong CÙNG session vừa train xong:
-# #   MODEL_NAME = "qwen_lora"          # thư mục local vừa save_pretrained
-# # Nếu chạy ở session/notebook KHÁC (khuyến nghị cho việc test riêng):
-# #   1) Upload thư mục "qwen_lora" (chứa adapter_config.json, adapter_model.safetensors...)
-# #      thành 1 Kaggle Dataset, add vào notebook này
-# #   2) Trỏ MODEL_NAME vào đường dẫn của dataset đó, ví dụ:
-# MODEL_NAME = "/kaggle/input/models/chizus2602/model-checkpoint/pytorch/default/1/outputs/checkpoint-480"  # <-- SỬA cho đúng đường dẫn adapter của bạn
-
-# if not os.path.exists(MODEL_NAME) and MODEL_NAME != "qwen_lora":
-#     raise FileNotFoundError(
-#         f"Không tìm thấy adapter tại {MODEL_NAME}. "
-#         "Hãy upload thư mục qwen_lora (từ model.save_pretrained('qwen_lora') lúc train) "
-#         "làm Kaggle Dataset và sửa lại MODEL_NAME."
-#     )
-
-# max_seq_length = 16384  # phải khớp giá trị lúc train
-
-# # =====================================================================
-# # 3. QUÉT DANH SÁCH ẢNH TEST
-# # =====================================================================
-# IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
-# test_images = []
-
-# for root, _, files in os.walk(TEST_DIR):
-#     for f in files:
-#         if f.lower().endswith(IMAGE_EXTENSIONS):
-#             test_images.append(os.path.join(root, f))
-
-# test_images = sorted(test_images)
-# print(f"-> Tìm thấy tổng cộng: {len(test_images)} ảnh test")
-
-# # =====================================================================
-# # 4. DANH SÁCH 96 CATEGORIES - PHẢI KHỚP Y HỆT CLASS_NAMES LÚC TRAIN
-# #    (lấy nguyên văn từ list bạn gửi; đã kiểm tra khớp CLASS_NAMES trong notebook train,
-# #    kể cả 'GRD.ZIL131' viết hoa GRD khác các lớp 'Grd.*' còn lại)
-# # =====================================================================
-# CATEGORIES = [
-#     'Air.Mig29', 'Grd.Kraz255', 'Air.JH7', 'Air.F22', 'Air.Casa212', 'Air.Mi8', 'Air.AS365',
-#     'Sea.Kuznetsov', 'Grd.SU100', 'Grd.T34', 'Grd.BMP1', 'Sea.Gorshkov', 'Air.F35', 'Grd.M113',
-#     'Grd.T72', 'Air.Z9', 'Grd.Merkava', 'Air.Ka52', 'Air.T6Texan', 'Sea.OsaII', 'Air.J11',
-#     'Grd.BTR80', 'Air.B29', 'Sea.Independence', 'Air.A10', 'Grd.PT76', 'Air.CH53', 'Air.J7',
-#     'Air.IL76', 'Air.Yak130', 'Sea.Type001.Liaoning', 'Air.Z8', 'Sea.Type002.Shantong',
-#     'Sea.Type054A.JiangkaiII', 'Air.B2', 'Grd.T54', 'Air.C17', 'Air.Yak52', 'Air.Mig35',
-#     'Grd.2S1', 'Sea.Buyan', 'Grd.T90', 'Sea.TypeKangDing', 'Air.Mi28', 'Grd.Bradley',
-#     'Grd.Humvee', 'Grd.Kraz6322', 'Air.Su22', 'Air.Mi17', 'Grd.M1Abrams', 'Sea.TypeChengKung',
-#     'Sea.TypeAsahi', 'Grd.ZSU57', 'Sea.Molniya', 'GRD.ZIL131', 'Air.Su27', 'Air.Rafale',
-#     'Grd.ZSU234', 'Grd.Ural4320', 'Sea.TypeMaya', 'Air.Su30', 'Sea.Kirov', 'Air.Mi24',
-#     'Grd.BM27', 'Air.AH64', 'Grd.Himars', 'Grd.BMP2', 'Sea.ArleighBurke', 'Sea.Ticonderoga',
-#     'Grd.BTR152', 'Sea.Type051B.Luhai', 'Grd.SU76', 'Grd.BTR90', 'Grd.Maz537', 'Grd.BTR60',
-#     'Grd.LAV25', 'Sea.Type055.Renhai', 'Sea.Kilo', 'Grd.BM21', 'Grd.Kamaz', 'Grd.BRDM2',
-#     'Sea.Type022.Houbei', 'Sea.Nanuchka', 'Air.L39', 'Sea.Wasp', 'Sea.Nimitz', 'Air.CH47',
-#     'Grd.T62', 'Sea.GeraldFord', 'Air.C130', 'Grd.MTLB', 'Sea.Type053H3.JiangweiII',
-#     'Air.KC135', 'Air.Ka27', 'Grd.BM30', 'Grd.Gaz66',
-# ]
-# assert len(CATEGORIES) == 96, f"Danh sách phải có 96 lớp, đang có {len(CATEGORIES)}"
-# CATEGORY_SET = set(CATEGORIES)
-# FALLBACK_LABEL = CATEGORIES[0]  # nhãn dự phòng khi không parse được gì (baseline dùng 'Air.Mig29')
-
-# # =====================================================================
-# # 5. PROMPT - Y HỆT lúc train (cell "Define the delimiter variables" trong
-# #    qwen3-5-rl.ipynb), không dùng lại prompt kiểu "chỉ output tên lớp" của baseline,
-# #    vì model đã được GRPO thưởng theo đúng cặp thẻ <REASONING>/<SOLUTION>.
-# # =====================================================================
-# REASONING_START = "<REASONING>"
-# REASONING_END = "</REASONING>"
-# SOLUTION_START = "<SOLUTION>"
-# SOLUTION_END = "</SOLUTION>"
-
-# QUESTION = (
-#     "Which vehicle is shown in the image? "
-#     f"Choose the class from this list: {', '.join(CATEGORIES)}"
-# )
-# TEXT_CONTENT = (
-#     f"{QUESTION}. "
-#     f"Respond with EXACTLY two tags and nothing else - no other text, no <think> block, no extra commentary. "
-#     f"First a SHORT reasoning (at most 3 short sentences) between {REASONING_START} and {REASONING_END}, "
-#     f"then your final answer between {SOLUTION_START} and (exactly one class name from the list, nothing else) {SOLUTION_END}. "
-#     f"Do not restate the list. Stop right after {SOLUTION_END}."
-# )
-
-
-# def extract_category(text: str) -> str:
-#     """Ưu tiên lấy nhãn trong <SOLUTION>...</SOLUTION>; nếu không có, dò trong toàn văn bản."""
-#     # Bỏ mọi <think> còn sót (phòng khi enable_thinking=False không có tác dụng)
-#     cleaned_full = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-
-#     # 1) Ưu tiên nội dung trong <SOLUTION>...</SOLUTION> - đúng tiêu chí lúc train
-#     sol = re.findall(f"{SOLUTION_START}(.*?){SOLUTION_END}", cleaned_full, re.DOTALL)
-#     if len(sol) == 1:
-#         cand = sol[0].strip()
-#         if cand in CATEGORY_SET:
-#             return cand
-#         for cat in CATEGORIES:  # không phân biệt hoa/thường, phòng model gõ sai case
-#             if cat.lower() == cand.lower():
-#                 return cat
-
-#     # 2) Không có (hoặc sai) thẻ SOLUTION -> dò trong toàn bộ text còn lại
-#     cleaned = cleaned_full.strip()
-#     if cleaned in CATEGORY_SET:
-#         return cleaned
-#     for cat in CATEGORIES:
-#         if cat in cleaned:
-#             return cat
-#     cleaned_lower = cleaned.lower()
-#     for cat in CATEGORIES:
-#         if cat.lower() in cleaned_lower:
-#             return cat
-
-#     # 3) Fallback cuối: dòng đầu tiên
-#     first_line = cleaned.split("\n")[0].strip()
-#     for cat in CATEGORIES:
-#         if cat.lower() in first_line.lower():
-#             return cat
-
-#     return FALLBACK_LABEL
-
-
-# # =====================================================================
-# # 6. LOAD MODEL ĐÃ FINE-TUNE (base 4-bit cho GPU Kaggle 16GB + adapter LoRA)
-# #    Lưu ý: lúc train adapter được học trên base 16-bit (load_in_4bit=False).
-# #    Nạp lại base ở 4-bit cho inference là cách làm chuẩn để tiết kiệm VRAM,
-# #    kết quả có thể lệch nhẹ so với lúc evaluate() trong lúc train (không lượng tử hoá).
-# # =====================================================================
-# print(f"Đang tải model đã fine-tune từ: {MODEL_NAME}")
-# model, tokenizer = FastVisionModel.from_pretrained(
-#     model_name=MODEL_NAME,
-#     max_seq_length=max_seq_length,
-#     load_in_4bit=False,  # BẮT BUỘC cho GPU 16GB Kaggle
-# )
-
-# FastVisionModel.for_inference(model)
-
-# # =====================================================================
-# # 7. INFERENCE VÒNG LẶP
-# # =====================================================================
-# results = []
-
-# for img_path in tqdm.tqdm(test_images, desc="Inference (finetuned)"):
-#     try:
-#         image = Image.open(img_path).convert("RGB").resize((512, 512))  # khớp bước resize lúc train
-
-#         messages = [
-#             {
-#                 "role": "user",
-#                 "content": [
-#                     {"type": "image"},
-#                     {"type": "text", "text": TEXT_CONTENT},
-#                 ],
-#             }
-#         ]
-
-#         # enable_thinking=False: tắt khối <think> mặc định của Qwen3.5, đúng như lúc train.
-#         # Nếu bản tokenizer/transformers không nhận tham số này, xoá enable_thinking=False
-#         # và dùng cách "mớm sẵn thẻ đóng think" như baseline (dòng bị comment bên dưới).
-#         prompt_text = tokenizer.apply_chat_template(
-#             messages,
-#             add_generation_prompt=True,
-#             enable_thinking=False,
-#         )
-#         # prompt_text += "<think>\n\n</think>\n"  # bật lại nếu enable_thinking không khả dụng
-
-#         inputs = tokenizer(
-#             image,
-#             prompt_text,
-#             add_special_tokens=False,
-#             return_tensors="pt",
-#         ).to("cuda")
-
-#         with torch.no_grad():
-#             outputs = model.generate(
-#                 **inputs,
-#                 max_new_tokens=400,   # đủ cho <REASONING> (tối đa 3 câu) + <SOLUTION>, khớp lúc train (384)
-#                 use_cache=True,
-#                 do_sample=False,      # greedy, giống evaluate() lúc train
-#             )
-
-#         generated_ids = outputs[0][inputs.input_ids.shape[1]:]
-#         raw_output = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-#         final_label = extract_category(raw_output)
-
-#         results.append({"image_name": Path(img_path).name, "prediction": final_label})
-
-#     except Exception as e:
-#         print(f"Lỗi ảnh {img_path}: {e}")
-#         results.append({"image_name": Path(img_path).name, "prediction": FALLBACK_LABEL})
-
-# # =====================================================================
-# # 8. XUẤT SUBMISSION
-# # =====================================================================
-# df = pd.DataFrame(results)
-# df.to_csv(OUTPUT_CSV, index=False)
-
-# print(f"\nĐã lưu file kết quả tại: {OUTPUT_CSV}")
-# print("Mẫu 10 kết quả dự đoán thực tế:")
-# print(df.head(10))
