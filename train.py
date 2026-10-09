@@ -276,7 +276,7 @@ from trl import GRPOConfig, GRPOTrainer
 
 # ---- Tham số tối ưu cho L40S (48GB VRAM) + NUM_GEN=4 ----
 # Mục tiêu: dùng ~40-45GB VRAM. Nếu OOM, giảm TRAIN_BATCH xuống 64.
-TRAIN_BATCH = int(os.environ.get("TRAIN_BATCH", 64))
+TRAIN_BATCH = int(os.environ.get("TRAIN_BATCH", 48))
 NUM_GEN     = int(os.environ.get("NUM_GEN", 4))
 GRAD_ACC    = int(os.environ.get("GRAD_ACC", 1))
 EPOCHS      = float(os.environ.get("EPOCHS", 1))
